@@ -13,7 +13,10 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["wifi", "monitor-mode", "nl80211", "wireless", "80211"]
 categories = ["network-programming", "os::linux-apis", "command-line-utilities"]
-exclude = ["STYLE_GUIDE_RS.MD"]
+# Kept out of the published tarball. The style guide is internal, and the CI
+# workflow and .gitignore only mean anything inside the repository; shipping
+# them to everyone who downloads the crate is noise.
+exclude = ["STYLE_GUIDE_RS.MD", ".github", ".gitignore"]
 repository = "https://github.com/tea-kettles/rfmon"
 
 [dependencies]
