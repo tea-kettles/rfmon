@@ -170,6 +170,7 @@ sudo tcpdump -i wlan0 -w cap.pcap  # capture with the tool of your choice
 sudo rfmon stop_monitor wlan0      # INFO managed mode iface=wlan0
 
 sudo rfmon reset                   # everything back to managed, services restarted
+# this one is for you people who kill your wifi with `airmon-ng check kill`
 ```
 
 Note that `stop_monitor all` also accepts a quoted `'*'`. Leave it unquoted and the shell will expand it first.
