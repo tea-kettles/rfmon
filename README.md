@@ -2,7 +2,7 @@
 
 Puts a Wi-Fi interface into 802.11 monitor mode on Linux and takes it back out again easily, safely, automatically, and not destructively like methods that require ```airmon-ng check kill``` to stop net management daemons. Library plus CLI.
 
-The interface is switched in place, so no `wlan0mon` clone appears. The switch is read back and verified in both directions, since a number of adapters accept the request without honoring it, and on the way out too, so a driver that never really left monitor mode cannot be reported as restored. Whatever currently owns the interface (NetworkManager, wpa_supplicant, or nothing at all) is released first and handed back on restore, so the same code path works on a desktop and on a headless box.
+The interface is switched in place, so no `wlan0mon` clone appears (but it can if you want it to). The switch is read back and verified in both directions, since a number of adapters accept the request without honoring it, and on the way out too, so a driver that never really left monitor mode cannot be reported as restored. Whatever currently owns the interface (NetworkManager, wpa_supplicant, or nothing at all) is released first and handed back on restore, so the same code path works on a desktop and on a headless box.
 
 `rfmon` does not read or write frames. It produces a monitor mode interface parked on a known channel, which is precisely the input `pcap`, `libpnet`, or a raw `AF_PACKET` socket expect. See [Scope](#scope).
 
@@ -11,7 +11,8 @@ The interface is switched in place, so no `wlan0mon` clone appears. The switch i
 | Platform | State |
 |---|---|
 | Linux | Implemented over nl80211 and rtnetlink, with NetworkManager and wpa_supplicant coordination. |
-| Windows | Compile only stub. Native Windows exposes no 802.11 monitor mode, so calls return `WindowsError::Unsupported`. An Npcap backed backend is the intended path. |
+| Windows | Compile only stub that'll be filled out later. Native Windows exposes no 802.11 monitor mode, so calls return `WindowsError::Unsupported`. An Npcap backed backend is the intended path. |
+| Mac | Planned but no promises |
 
 Every operation that changes an interface requires `CAP_NET_ADMIN`, most easily obtained by running as root. Enumeration (`WirelessInterface::detect` and the CLI's `list`) reads the nl80211 dumps any user can read, so it needs no privileges.
 
