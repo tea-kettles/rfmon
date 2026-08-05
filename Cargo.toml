@@ -1,0 +1,63 @@
+[package]
+name = "rfmon"
+version = "0.1.0"
+edition = "2024"
+# 1.87 is the floor imposed by the zbus tree, which the default `dbus` feature
+# pulls in. The crate's own code needs only 1.85 (edition 2024), and a
+# `--no-default-features` build genuinely compiles there, but Cargo has one
+# `rust-version` per package, so this states the floor for the default feature
+# set. The `msrv` CI job checks it against `--all-features`.
+rust-version = "1.87"
+description = "A simple, durable library and CLI for driving a Wi-Fi interface in and out of 802.11 monitor mode on Linux."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["wifi", "monitor-mode", "nl80211", "wireless", "80211"]
+categories = ["network-programming", "os::linux-apis", "command-line-utilities"]
+exclude = ["STYLE_GUIDE_RS.MD"]
+repository = "https://github.com/tea-kettles/rfmon"
+
+[dependencies]
+futures = "0.3.33"
+rtnetlink = "0.21.0"
+thiserror = "2.0.19"
+# The library itself only needs the current-thread runtime (spawn + the
+# drop-time restore runtime), its IO driver (netlink sockets), and timers. The
+# `macros` and `rt-multi-thread` features are for the binary, examples, and
+# tests (see dev-dependencies and the `cli` feature), so library consumers do
+# not pull them.
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
+wl-nl80211 = { version = "0.4.0", default-features = false, features = ["tokio_socket"] }
+# D-Bus coordination with NetworkManager / wpa_supplicant. Optional and on by
+# default (see the `dbus` feature); a headless build can drop it, and with it
+# roughly half the dependency tree.
+zbus = { version = "5.18.0", default-features = false, features = ["tokio"], optional = true }
+
+[dev-dependencies]
+# `#[tokio::test]` (macros), the examples' `#[tokio::main]` (multi-thread), and
+# the virtual clock (`test-util`) the timeout tests drive with `pause`/`advance`
+# so no test spends real seconds waiting on a deadline. Dev-only, so none of
+# these reach a library consumer's build.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[features]
+default = ["dbus"]
+
+# NetworkManager / wpa_supplicant coordination over D-Bus. On by default. With it
+# off, entering and leaving monitor mode is the raw nl80211/rtnetlink switch with
+# no service handoff, which is correct on a headless host that runs neither, and it drops
+# the zbus dependency subtree entirely.
+dbus = ["dep:zbus"]
+
+# The `rfmon` CLI binary. Off by default so library consumers don't pull a
+# tracing subscriber. The binary's `#[tokio::main]` needs the multi-thread
+# runtime and the macro, so the feature adds those to tokio. Build/install with
+# `--features cli`.
+cli = ["dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/macros"]
+
+[[bin]]
+name = "rfmon"
+path = "src/bin/rfmon.rs"
+required-features = ["cli"]

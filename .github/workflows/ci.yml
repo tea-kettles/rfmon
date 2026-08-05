@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so an advisory against a dependency surfaces without waiting for
+    # the next push to a crate that may go quiet between releases.
+    - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Formatting is repository-wide, so it runs once rather than per feature set.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --all --check
+
+  # The feature matrix. Every combination has to build, lint clean and pass its
+  # tests: `dbus` swaps out the whole NetworkManager/wpa_supplicant coordination
+  # layer, and `cli` changes which tokio features are compiled in, so a green
+  # `--all-features` run says nothing about the others.
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no features
+            flags: --no-default-features
+          - name: dbus
+            flags: --no-default-features --features dbus
+          - name: cli
+            flags: --no-default-features --features cli
+          - name: all features
+            flags: --all-features
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: clippy
+        run: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings
+      - name: test
+        run: cargo test ${{ matrix.flags }}
+
+  # The crate claims a `rust-version`. Nothing enforces that except this.
+  msrv:
+    name: minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Read the floor out of Cargo.toml rather than hardcoding it here, so the
+      # declared value and the value actually checked cannot drift apart.
+      - name: install the declared MSRV
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 \
+                  | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["rust_version"])')
+          echo "checking against Rust $msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --all-targets --all-features
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A prebuilt binary rather than `cargo install cargo-audit`, which builds
+      # it from source on every run: slower, and it fails whenever cargo-audit's
+      # own toolchain requirements drift out of step with the runner's.
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit

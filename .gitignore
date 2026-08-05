@@ -1,0 +1,9 @@
+/target
+
+# Internal style guide. Kept in the working tree, and `Cargo.toml`'s `exclude`
+# still needs it named so a `cargo package` run from a checkout that has it
+# cannot bundle it, but deliberately not published.
+STYLE_GUIDE_RS.MD
+
+# Per-machine tool permissions, not project configuration.
+.claude/settings.local.json
