@@ -830,12 +830,12 @@ pub fn channel_from_mhz(mhz: u32) -> Option<u32> {
     // (e.g. 2413 -> 1). The lower bounds also exclude channel 0, which the
     // linear formula would otherwise produce at the base frequency itself.
     match mhz {
-        2412..=2472 if (mhz - 2412) % 5 == 0 => Some((mhz - 2407) / 5),
+        2412..=2472 if (mhz - 2412).is_multiple_of(5) => Some((mhz - 2407) / 5),
         2484 => Some(14),
         // 6 GHz channel 2 is the outlier below the linear grid.
         5935 => Some(2),
-        5005..=5895 if (mhz - 5000) % 5 == 0 => Some((mhz - 5000) / 5),
-        5955..=7115 if (mhz - 5950) % 5 == 0 => Some((mhz - 5950) / 5),
+        5005..=5895 if (mhz - 5000).is_multiple_of(5) => Some((mhz - 5000) / 5),
+        5955..=7115 if (mhz - 5950).is_multiple_of(5) => Some((mhz - 5950) / 5),
         _ => None,
     }
 }
