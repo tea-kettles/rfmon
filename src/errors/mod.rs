@@ -126,7 +126,7 @@ pub enum Error {
     /// search.
     ///
     /// `set_channel` covers 2.4 and 5 GHz; `set_channel_6g` covers 6 GHz. The
-    /// two bands reuse channel numbers (1, 5, 9, 13 and 149–177), so which
+    /// two bands reuse channel numbers (1, 5, 9, 13 and 149-177), so which
     /// function you call is what selects the band, and this error names the one
     /// that would have found the channel.
     #[error("channel {channel} on '{iface}' is in another band; use {alternative}() to tune it")]

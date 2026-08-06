@@ -42,7 +42,7 @@ async fn main() -> rfmon::Result<()> {
 // The work done while the interface is in monitor mode. A real tool would tune
 // and capture here; this just optionally sets a channel and holds briefly.
 async fn session(guard: &rfmon::MonitorGuard) -> rfmon::Result<()> {
-    // Optional second argument: a channel to tune to (2.4 GHz 1–14, 5 GHz 36+).
+    // Optional second argument: a channel to tune to (2.4 GHz 1-14, 5 GHz 36+).
     // Tuning through the guard reuses the interface it already resolved, so no
     // re-enumeration. This is the path a channel-hopping loop would take.
     if let Some(channel) = std::env::args().nth(2).and_then(|s| s.parse::<u32>().ok()) {

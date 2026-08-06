@@ -270,13 +270,13 @@ pub fn start_monitor_as(name: &str, new_name: &str) -> MonitorBuilder {
 /// Set the operating channel of a monitor-mode interface, on 2.4 or 5 GHz.
 ///
 /// Returns a builder that runs when awaited and yields the interface name. The
-/// channel is a plain channel number: 2.4 GHz is 1–14 and 5 GHz is 32–177, and
+/// channel is a plain channel number: 2.4 GHz is 1-14 and 5 GHz is 32-177, and
 /// those two do not overlap, so the number alone picks the band. The frequency
 /// is then resolved against the channels the device actually supports. Defaults
 /// to 20 MHz, which carries all management and EAPOL traffic.
 ///
 /// **6 GHz is deliberately not searched here**, because it reuses channel numbers that
-/// 2.4 GHz and 5 GHz already use (1, 5, 9, 13 and 149–177), so a bare number
+/// 2.4 GHz and 5 GHz already use (1, 5, 9, 13 and 149-177), so a bare number
 /// would be ambiguous on a Wi-Fi 6E adapter. Use [`set_channel_6g`] for that
 /// band; asking for a 6 GHz-only number here returns
 /// [`Error::WrongBand`](crate::Error::WrongBand) naming the call you want.

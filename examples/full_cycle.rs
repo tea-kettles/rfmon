@@ -850,11 +850,11 @@ fn has_channel_in(iface: &InterfaceInfo, channel: u32, band: BandKind) -> bool {
 }
 
 fn banner(number: &str, title: &str) {
-    info!("──── phase {number}: {title} ────");
+    info!("---- phase {number}: {title} ----");
 }
 
 fn summarize(report: &Report) {
-    info!("──── summary ────");
+    info!("---- summary ----");
     info!(
         passed = report.passed,
         failed = report.failed.len(),
