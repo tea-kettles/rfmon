@@ -2,73 +2,45 @@
 name = "rfmon"
 version = "0.1.0"
 edition = "2024"
-# 1.87 is the floor imposed by the zbus tree, which the default `dbus` feature
-# pulls in. The crate's own code needs only 1.85 (edition 2024), and a
-# `--no-default-features` build genuinely compiles there, but Cargo has one
-# `rust-version` per package, so this states the floor for the default feature
-# set. The `msrv` CI job checks it against `--all-features`.
+# The zbus tree's floor, not this crate's; the code itself needs only 1.85.
 rust-version = "1.87"
 description = "A simple, durable library and CLI for driving a Wi-Fi interface in and out of 802.11 monitor mode on Linux."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["wifi", "monitor-mode", "nl80211", "wireless", "80211"]
 categories = ["network-programming", "os::linux-apis", "command-line-utilities"]
-# Kept out of the published tarball. The style guide is internal, and the CI
-# workflow and .gitignore only mean anything inside the repository; shipping
-# them to everyone who downloads the crate is noise.
 exclude = ["STYLE_GUIDE_RS.MD", ".github", ".gitignore"]
 repository = "https://github.com/tea-kettles/rfmon"
 
 [dependencies]
 futures = "0.3.33"
 thiserror = "2.0.19"
-# The library itself only needs the current-thread runtime (spawn + the
-# drop-time restore runtime), its IO driver (netlink sockets), and timers. The
-# `macros` and `rt-multi-thread` features are for the binary, examples, and
-# tests (see dev-dependencies and the `cli` feature), so library consumers do
-# not pull them.
+# Deliberately minimal: `macros` and `rt-multi-thread` come from the `cli`
+# feature and dev-dependencies, so library consumers never pull them.
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 
-# The kernel-facing dependencies, declared per target rather than unconditionally.
-#
-# Both wrap netlink, which is a Linux kernel interface with no equivalent
-# elsewhere, so on any other target they do not merely go unused: they fail to
-# compile. Cargo builds dependencies before the crate that names them, so left
-# in the table above they would break first, and the `compile_error!` in lib.rs
-# that explains the situation would never be reached. Gating them here is what
-# makes that message the thing a non-Linux user actually sees.
+# Do not move these into [dependencies]. They wrap netlink and D-Bus and do not
+# compile off Linux, and cargo builds dependencies before the crate naming them,
+# so ungated they fail first and the `compile_error!` in lib.rs explaining that
+# Linux is the only target is never reached.
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.21.0"
 wl-nl80211 = { version = "0.4.0", default-features = false, features = ["tokio_socket"] }
-# D-Bus coordination with NetworkManager / wpa_supplicant. Optional and on by
-# default (see the `dbus` feature); a headless build can drop it, and with it
-# roughly half the dependency tree. Linux-gated with the rest: NetworkManager and
-# wpa_supplicant are what it talks to, and neither exists off Linux.
 zbus = { version = "5.18.0", default-features = false, features = ["tokio"], optional = true }
 
 [dev-dependencies]
-# `#[tokio::test]` (macros), the examples' `#[tokio::main]` (multi-thread), and
-# the virtual clock (`test-util`) the timeout tests drive with `pause`/`advance`
-# so no test spends real seconds waiting on a deadline. Dev-only, so none of
-# these reach a library consumer's build.
+# `test-util` drives the virtual clock the timeout tests advance, so none of
+# them spends real seconds waiting on a deadline.
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "test-util"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [features]
 default = ["dbus"]
-
-# NetworkManager / wpa_supplicant coordination over D-Bus. On by default. With it
-# off, entering and leaving monitor mode is the raw nl80211/rtnetlink switch with
-# no service handoff, which is correct on a headless host that runs neither, and it drops
-# the zbus dependency subtree entirely.
+# NetworkManager / wpa_supplicant coordination. Off leaves the raw nl80211 switch
+# and drops the zbus subtree.
 dbus = ["dep:zbus"]
-
-# The `rfmon` CLI binary. Off by default so library consumers don't pull a
-# tracing subscriber. The binary's `#[tokio::main]` needs the multi-thread
-# runtime and the macro, so the feature adds those to tokio. Build/install with
-# `--features cli`.
 cli = ["dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/macros"]
 
 [[bin]]
