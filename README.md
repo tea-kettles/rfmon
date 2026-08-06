@@ -1,6 +1,6 @@
 # rfmon
 
-Puts a Wi-Fi interface into 802.11 monitor mode on Linux and takes it back out again easily, safely, automatically, and not destructively like methods that require ```airmon-ng check kill``` to stop net management daemons. Library plus CLI.
+Puts a Wi-Fi interface into 802.11 monitor mode on Linux and takes it back out again easily, safely, automatically, and not destructively like methods that require `airmon-ng check kill` to stop net management daemons. Library plus CLI.
 
 The interface is switched in place, so no `wlan0mon` clone appears (but it can if you want it to). The switch is read back and verified in both directions, since a number of adapters accept the request without honoring it, and on the way out too, so a driver that never really left monitor mode cannot be reported as restored. Whatever currently owns the interface (NetworkManager, wpa_supplicant, or nothing at all) is released first and handed back on restore, so the same code path works on a desktop and on a headless box.
 
