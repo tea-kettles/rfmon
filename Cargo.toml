@@ -1,10 +1,10 @@
 [package]
 name = "rfmon"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # The zbus tree's floor, not this crate's; the code itself needs only 1.85.
 rust-version = "1.87"
-description = "A simple, durable library and CLI for driving a Wi-Fi interface in and out of 802.11 monitor mode on Linux."
+description = "Linux 802.11 monitor mode library and CLI without killing NetworkManager or wpa_supplicant"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["wifi", "monitor-mode", "nl80211", "wireless", "80211"]
