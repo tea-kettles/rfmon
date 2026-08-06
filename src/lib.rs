@@ -1,5 +1,5 @@
-//! `rfmon`, a simple, cross-platform library for driving a wireless interface
-//! in and out of 802.11 monitor mode.
+//! `rfmon`, a simple, durable library for driving a wireless interface in and
+//! out of 802.11 monitor mode on Linux.
 //!
 //! The whole library is three version- and distro-agnostic calls:
 //!
@@ -37,9 +37,10 @@
 //!
 //! # Platform support
 //!
-//! Linux is fully implemented over nl80211/rtnetlink with NetworkManager and
-//! wpa_supplicant coordination. Windows is a compile-only stub pending an
-//! Npcap-based backend; its calls return `WindowsError::Unsupported`.
+//! Linux only, over nl80211/rtnetlink with NetworkManager and wpa_supplicant
+//! coordination. Monitor mode is an OS-level capability rather than something a
+//! library can polyfill, so any other target fails to compile with a message
+//! saying so rather than building into calls that cannot work.
 //!
 //! # Features
 //!
@@ -93,22 +94,26 @@ mod monitor;
 #[cfg(target_os = "linux")]
 #[cfg_attr(test, allow(dead_code))]
 mod linux;
-#[cfg(target_os = "windows")]
-#[cfg_attr(test, allow(dead_code))]
-mod windows;
 
-// Exactly one backend is compiled in per target, and `crate::monitor::Backend`
-// aliases it. On an unsupported target the build stops here with an explanation;
-// `unsupported` then supplies a placeholder `Backend` so that explanation is the
-// *only* error, rather than being buried under an "undeclared type `Backend`"
-// at every call site in `monitor`.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+// One backend, selected per target, aliased as `crate::monitor::Backend`. On any
+// other target the build stops here with an explanation; `unsupported` then
+// supplies a placeholder `Backend` so that explanation is the *only* error,
+// rather than being buried under an "undeclared type `Backend`" at every call
+// site in `monitor`.
+//
+// This message is only reachable because the nl80211 and rtnetlink dependencies
+// are declared under a `cfg(target_os = "linux")` target table in Cargo.toml.
+// Left unconditional they would be compiled first and fail on their own, and
+// this explanation would never be printed.
+#[cfg(not(target_os = "linux"))]
 compile_error!(
-    "rfmon has no monitor-mode backend for this target: Linux is implemented \
-     over nl80211, Windows is a compile-only stub, and nothing else is supported. \
-     802.11 monitor mode is an OS-level capability, so there is no portable fallback."
+    "rfmon supports Linux only. The backend is built on nl80211 and rtnetlink, \
+     and 802.11 monitor mode is an OS-level capability with no portable \
+     equivalent, so there is nothing to fall back to on this target. Depend on \
+     rfmon under a [target.'cfg(target_os = \"linux\")'.dependencies] table if \
+     the rest of your project is cross-platform."
 );
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(target_os = "linux"))]
 mod unsupported;
 
 pub use cleanup::MonitorGuard;

@@ -41,10 +41,8 @@ use crate::{Error, Result};
 
 #[cfg(all(target_os = "linux", not(test)))]
 use crate::linux::LinuxBackend as Backend;
-#[cfg(all(not(any(target_os = "linux", target_os = "windows")), not(test)))]
+#[cfg(all(not(target_os = "linux"), not(test)))]
 use crate::unsupported::UnsupportedBackend as Backend;
-#[cfg(all(target_os = "windows", not(test)))]
-use crate::windows::WindowsBackend as Backend;
 #[cfg(test)]
 use tests::MockBackend as Backend;
 

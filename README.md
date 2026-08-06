@@ -11,8 +11,16 @@ The interface is switched in place, so no `wlan0mon` clone appears (but it can i
 | Platform | State |
 |---|---|
 | Linux | Implemented over nl80211 and rtnetlink, with NetworkManager and wpa_supplicant coordination. |
-| Windows | Compile only stub that'll be filled out later. Native Windows exposes no 802.11 monitor mode, so calls return `WindowsError::Unsupported`. An Npcap backed backend is the intended path. |
-| Mac | Planned but no promises |
+| Everything else | Planned but no promises. |
+
+Linux only for now. Monitor mode is an OS level capability rather than something a library can polyfill, so the rest is a real port and not a shim. Anywhere else, `rfmon` does not build, deliberately: the netlink dependencies are declared under a `cfg(target_os = "linux")` target table and the crate fails with one error explaining that Linux is the only supported target. That is the honest outcome. A crate that compiled and then failed at every call would only move the same news to runtime.
+
+If the rest of your project is cross platform, depend on it per target:
+
+```toml
+[target.'cfg(target_os = "linux")'.dependencies]
+rfmon = "0.1"
+```
 
 Every operation that changes an interface requires `CAP_NET_ADMIN`, most easily obtained by running as root. Enumeration (`InterfaceInfo::detect` and the CLI's `list`) reads the nl80211 dumps any user can read, so it needs no privileges.
 

@@ -21,7 +21,6 @@ repository = "https://github.com/tea-kettles/rfmon"
 
 [dependencies]
 futures = "0.3.33"
-rtnetlink = "0.21.0"
 thiserror = "2.0.19"
 # The library itself only needs the current-thread runtime (spawn + the
 # drop-time restore runtime), its IO driver (netlink sockets), and timers. The
@@ -31,10 +30,22 @@ thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
+
+# The kernel-facing dependencies, declared per target rather than unconditionally.
+#
+# Both wrap netlink, which is a Linux kernel interface with no equivalent
+# elsewhere, so on any other target they do not merely go unused: they fail to
+# compile. Cargo builds dependencies before the crate that names them, so left
+# in the table above they would break first, and the `compile_error!` in lib.rs
+# that explains the situation would never be reached. Gating them here is what
+# makes that message the thing a non-Linux user actually sees.
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = "0.21.0"
 wl-nl80211 = { version = "0.4.0", default-features = false, features = ["tokio_socket"] }
 # D-Bus coordination with NetworkManager / wpa_supplicant. Optional and on by
 # default (see the `dbus` feature); a headless build can drop it, and with it
-# roughly half the dependency tree.
+# roughly half the dependency tree. Linux-gated with the rest: NetworkManager and
+# wpa_supplicant are what it talks to, and neither exists off Linux.
 zbus = { version = "5.18.0", default-features = false, features = ["tokio"], optional = true }
 
 [dev-dependencies]

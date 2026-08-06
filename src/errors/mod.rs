@@ -1,29 +1,27 @@
 //! Crate error types.
 //!
-//! Platform-specific errors live in per-platform files under `errors/` and are
-//! aggregated here into a single public [`Error`]. Each of those files is
-//! `cfg`-gated to one target, so the split is what keeps a Linux-only error out
-//! of a Windows build. Callers import [`Result`] and either handle the
+//! Backend errors live in per-platform files under `errors/` and are aggregated
+//! here into a single public [`Error`]. Linux is the only backend today, so
+//! [`LinuxError`] is the only one of those, but it stays `cfg`-gated and behind
+//! its own wrapper variant rather than being flattened into [`Error`]: that is
+//! what keeps nl80211- and D-Bus-shaped failures out of the parts of the API a
+//! second backend would share. Callers import [`Result`] and either handle the
 //! crate-level [`Error`] or match into the platform error it transparently
 //! wraps.
 //!
 //! Selection failures (no interfaces, none monitor-capable, a named interface
-//! that does not exist) are *platform-neutral*, since the same logic runs on every
-//! OS, so they are variants on [`Error`] directly rather than on any platform
-//! error. Giving them their own wrapper enum to mirror the per-platform layout
-//! would buy nothing: they are not conditionally compiled, and it would leave
-//! the aggregate [`Error`] a wrapper around wrappers, with callers matching two
-//! layers deep for something as ordinary as `NotFound`.
+//! that does not exist) are *platform-neutral*, since the same logic would run
+//! on any backend, so they are variants on [`Error`] directly. Giving them their
+//! own wrapper enum to mirror the per-platform layout would buy nothing: they
+//! are not conditionally compiled, and it would leave the aggregate [`Error`] a
+//! wrapper around wrappers, with callers matching two layers deep for something
+//! as ordinary as `NotFound`.
 
 #[cfg(target_os = "linux")]
 mod linux_errors;
-#[cfg(target_os = "windows")]
-mod windows_errors;
 
 #[cfg(target_os = "linux")]
 pub use linux_errors::{FrequencyReadback, LinuxError, WidthReadback};
-#[cfg(target_os = "windows")]
-pub use windows_errors::WindowsError;
 
 /// Convenience alias for fallible operations across the crate.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -171,9 +169,4 @@ pub enum Error {
     #[cfg(target_os = "linux")]
     #[error(transparent)]
     Linux(#[from] LinuxError),
-
-    /// A failure in the Windows backend.
-    #[cfg(target_os = "windows")]
-    #[error(transparent)]
-    Windows(#[from] WindowsError),
 }
