@@ -16,7 +16,7 @@ pub(crate) mod npcap;
 
 use crate::Result;
 use crate::errors::WindowsError;
-use crate::interface::WirelessInterface;
+use crate::interface::InterfaceInfo;
 use crate::monitor::MonitorBackend;
 
 /* Types */
@@ -30,19 +30,19 @@ pub(crate) struct WindowsBackend;
 /* Implementations */
 
 impl MonitorBackend for WindowsBackend {
-    async fn detect() -> Result<Vec<WirelessInterface>> {
+    async fn detect() -> Result<Vec<InterfaceInfo>> {
         Err(WindowsError::Unsupported.into())
     }
 
-    async fn start_auto() -> Result<WirelessInterface> {
+    async fn start_auto() -> Result<InterfaceInfo> {
         Err(WindowsError::Unsupported.into())
     }
 
-    async fn start_on(_name: &str) -> Result<WirelessInterface> {
+    async fn start_on(_name: &str) -> Result<InterfaceInfo> {
         Err(WindowsError::Unsupported.into())
     }
 
-    async fn start_as(_name: &str, _new_name: &str) -> Result<WirelessInterface> {
+    async fn start_as(_name: &str, _new_name: &str) -> Result<InterfaceInfo> {
         Err(WindowsError::Unsupported.into())
     }
 
@@ -51,10 +51,14 @@ impl MonitorBackend for WindowsBackend {
     }
 
     async fn set_channel(
-        _iface: &WirelessInterface,
+        _iface: &InterfaceInfo,
         _freq_mhz: u32,
         _width: crate::interface::ChannelWidth,
     ) -> Result<()> {
+        Err(WindowsError::Unsupported.into())
+    }
+
+    async fn read_tuning(_iface: &InterfaceInfo) -> Result<crate::interface::Tuning> {
         Err(WindowsError::Unsupported.into())
     }
 

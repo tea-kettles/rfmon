@@ -11,7 +11,7 @@
 //! that selects this backend, so the bodies are [`unreachable!`].
 
 use crate::Result;
-use crate::interface::{ChannelWidth, WirelessInterface};
+use crate::interface::{ChannelWidth, InterfaceInfo, Tuning};
 use crate::monitor::MonitorBackend;
 
 /* Types */
@@ -23,19 +23,19 @@ pub(crate) struct UnsupportedBackend;
 /* Implementations */
 
 impl MonitorBackend for UnsupportedBackend {
-    async fn detect() -> Result<Vec<WirelessInterface>> {
+    async fn detect() -> Result<Vec<InterfaceInfo>> {
         unreachable!("rfmon has no backend for this target; see the compile_error in lib.rs")
     }
 
-    async fn start_auto() -> Result<WirelessInterface> {
+    async fn start_auto() -> Result<InterfaceInfo> {
         unreachable!("rfmon has no backend for this target; see the compile_error in lib.rs")
     }
 
-    async fn start_on(_name: &str) -> Result<WirelessInterface> {
+    async fn start_on(_name: &str) -> Result<InterfaceInfo> {
         unreachable!("rfmon has no backend for this target; see the compile_error in lib.rs")
     }
 
-    async fn start_as(_name: &str, _new_name: &str) -> Result<WirelessInterface> {
+    async fn start_as(_name: &str, _new_name: &str) -> Result<InterfaceInfo> {
         unreachable!("rfmon has no backend for this target; see the compile_error in lib.rs")
     }
 
@@ -44,10 +44,14 @@ impl MonitorBackend for UnsupportedBackend {
     }
 
     async fn set_channel(
-        _iface: &WirelessInterface,
+        _iface: &InterfaceInfo,
         _freq_mhz: u32,
         _width: ChannelWidth,
     ) -> Result<()> {
+        unreachable!("rfmon has no backend for this target; see the compile_error in lib.rs")
+    }
+
+    async fn read_tuning(_iface: &InterfaceInfo) -> Result<Tuning> {
         unreachable!("rfmon has no backend for this target; see the compile_error in lib.rs")
     }
 

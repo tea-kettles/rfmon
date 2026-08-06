@@ -18,18 +18,22 @@
 //! ```
 //!
 //! * [`start_monitor`] picks the best monitor-capable radio using the scoring in
-//!   [`WirelessInterface::monitor_score`].
+//!   [`InterfaceInfo::monitor_score`].
 //! * [`start_monitor_on`] targets a specific interface by name.
 //! * [`start_monitor_as`] additionally renames the interface for the session.
 //! * [`stop_monitor`] returns an interface to managed networking by name: the
 //!   stateless recovery path when you don't hold a guard.
 //!
-//! The `start_*` functions return a [`MonitorGuard`] that restores the interface
-//! when it drops (or via [`MonitorGuard::restore`]), so cleanup is scope-safe
-//! even on an early return. [`stop_monitor`] covers what a guard cannot: fixing
-//! an interface by name after a crash or from another process. Everything
-//! requires `CAP_NET_ADMIN` (root) and is durable across distributions. A host
-//! with no NetworkManager, bare wpa_supplicant, or neither is handled.
+//! The `start_*` functions return a [`MonitorBuilder`], which does nothing until
+//! awaited and then yields a [`MonitorGuard`] that restores the interface when it
+//! drops (or via [`MonitorGuard::restore`]), so cleanup is scope-safe even on an
+//! early return. The builder is also where a channel can be named, so a session
+//! is specified in one statement: `start_monitor().on_channel(36).await?`.
+//!
+//! [`stop_monitor`] covers what a guard cannot: fixing an interface by name
+//! after a crash or from another process. Everything requires `CAP_NET_ADMIN`
+//! (root) and is durable across distributions. A host with no NetworkManager,
+//! bare wpa_supplicant, or neither is handled.
 //!
 //! # Platform support
 //!
@@ -55,8 +59,24 @@
 //!   not pull in a tracing subscriber. Install with
 //!   `cargo install rfmon --features cli`.
 //!
-//! For lower-level inspection, [`WirelessInterface::detect`] enumerates every
-//! interface with its device capabilities (modes, bands, channels).
+//! # The data model
+//!
+//! Two types, and interface names as the currency between them.
+//!
+//! [`InterfaceInfo`] is a *snapshot* of one radio's facts: MAC, bands, driver,
+//! bus, and what it was doing when the enumeration ran. Get one from
+//! [`InterfaceInfo::detect`] (every interface) or [`InterfaceInfo::lookup`] (one
+//! by name); both need no privileges. Every getter on it is a free field read,
+//! and it does not track the interface: `is_monitor()` reports what was true at
+//! the dump, so re-read it when it matters.
+//!
+//! [`MonitorGuard`] is an owned *session*. It holds the snapshot it started from
+//! ([`MonitorGuard::info`]), reads live state on request
+//! ([`MonitorGuard::tuning`]), and restores the interface when it drops.
+//!
+//! Names are what pass between them and what every entry point takes. A name is
+//! also the only one of the three that outlives the process, which is why
+//! [`stop_monitor`] takes one rather than an object.
 
 #![warn(missing_docs)]
 
@@ -94,12 +114,12 @@ mod unsupported;
 pub use cleanup::MonitorGuard;
 pub use errors::{Error, Result};
 pub use interface::{
-    Band, BandKind, BusKind, ChannelWidth, Frequency, InterfaceMode, WirelessInterface,
+    Band, BandKind, BusKind, ChannelWidth, Frequency, InterfaceInfo, InterfaceMode, Tuning,
     channel_from_mhz,
 };
 pub use monitor::{
-    SetChannel, set_channel, set_channel_6g, start_monitor, start_monitor_as, start_monitor_on,
-    stop_all_monitors, stop_monitor,
+    MonitorBuilder, SetChannel, set_channel, set_channel_6g, start_monitor, start_monitor_as,
+    start_monitor_on, stop_all_monitors, stop_monitor,
 };
 
 /* Types */

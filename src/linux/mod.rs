@@ -25,8 +25,7 @@ use std::time::Duration;
 use tracing::{debug, instrument, warn};
 
 use crate::errors::{LinuxError, WidthReadback};
-use crate::interface::{ChannelWidth, InterfaceMode, WirelessInterface, rank_candidates};
-use crate::linux::interface::ChannelState;
+use crate::interface::{ChannelWidth, InterfaceInfo, InterfaceMode, Tuning, rank_candidates};
 use crate::monitor::MonitorBackend;
 use crate::{Error, Result};
 
@@ -87,11 +86,11 @@ impl Holders {
 // kernel and D-Bus reached only through `RealOps`.
 #[allow(async_fn_in_trait)]
 trait LinuxOps {
-    async fn detect() -> Result<Vec<WirelessInterface>>;
-    async fn set_mode(iface: &WirelessInterface, mode: InterfaceMode) -> Result<()>;
+    async fn detect() -> Result<Vec<InterfaceInfo>>;
+    async fn set_mode(iface: &InterfaceInfo, mode: InterfaceMode) -> Result<()>;
     async fn read_mode(index: u32) -> Result<InterfaceMode>;
-    async fn set_freq(iface: &WirelessInterface, freq_mhz: u32, width: ChannelWidth) -> Result<()>;
-    async fn read_channel(index: u32) -> Result<ChannelState>;
+    async fn set_freq(iface: &InterfaceInfo, freq_mhz: u32, width: ChannelWidth) -> Result<()>;
+    async fn read_channel(index: u32) -> Result<Tuning>;
     async fn rename(index: u32, old: &str, new: &str) -> Result<()>;
     async fn nm_present() -> bool;
     async fn nm_release(iface: &str) -> Result<()>;
@@ -106,19 +105,19 @@ trait LinuxOps {
 struct RealOps;
 
 impl LinuxOps for RealOps {
-    async fn detect() -> Result<Vec<WirelessInterface>> {
+    async fn detect() -> Result<Vec<InterfaceInfo>> {
         interface::detect().await
     }
-    async fn set_mode(iface: &WirelessInterface, mode: InterfaceMode) -> Result<()> {
+    async fn set_mode(iface: &InterfaceInfo, mode: InterfaceMode) -> Result<()> {
         interface::set_mode(iface, mode).await
     }
     async fn read_mode(index: u32) -> Result<InterfaceMode> {
         interface::read_mode(index).await
     }
-    async fn set_freq(iface: &WirelessInterface, freq_mhz: u32, width: ChannelWidth) -> Result<()> {
+    async fn set_freq(iface: &InterfaceInfo, freq_mhz: u32, width: ChannelWidth) -> Result<()> {
         interface::set_channel(iface.index(), iface.name(), freq_mhz, width).await
     }
-    async fn read_channel(index: u32) -> Result<ChannelState> {
+    async fn read_channel(index: u32) -> Result<Tuning> {
         interface::read_channel(index).await
     }
     async fn rename(index: u32, old: &str, new: &str) -> Result<()> {
@@ -197,19 +196,19 @@ impl LinuxOps for RealOps {
 /* Implementations */
 
 impl MonitorBackend for LinuxBackend {
-    async fn detect() -> Result<Vec<WirelessInterface>> {
+    async fn detect() -> Result<Vec<InterfaceInfo>> {
         interface::detect().await
     }
 
-    async fn start_auto() -> Result<WirelessInterface> {
+    async fn start_auto() -> Result<InterfaceInfo> {
         start_auto_impl::<RealOps>().await
     }
 
-    async fn start_on(name: &str) -> Result<WirelessInterface> {
+    async fn start_on(name: &str) -> Result<InterfaceInfo> {
         start_on_impl::<RealOps>(name).await
     }
 
-    async fn start_as(name: &str, new_name: &str) -> Result<WirelessInterface> {
+    async fn start_as(name: &str, new_name: &str) -> Result<InterfaceInfo> {
         start_as_impl::<RealOps>(name, new_name).await
     }
 
@@ -218,12 +217,12 @@ impl MonitorBackend for LinuxBackend {
         interface::rename(iface.index(), current, new).await
     }
 
-    async fn set_channel(
-        iface: &WirelessInterface,
-        freq_mhz: u32,
-        width: ChannelWidth,
-    ) -> Result<()> {
+    async fn set_channel(iface: &InterfaceInfo, freq_mhz: u32, width: ChannelWidth) -> Result<()> {
         set_channel_verified::<RealOps>(iface, freq_mhz, width).await
+    }
+
+    async fn read_tuning(iface: &InterfaceInfo) -> Result<Tuning> {
+        interface::read_channel(iface.index()).await
     }
 
     async fn stop(name: &str) -> Result<()> {
@@ -237,7 +236,7 @@ impl MonitorBackend for LinuxBackend {
 // the iftype, and confirm the switch took. On any failure after release, hand
 // control back before returning the error so we never strand the interface.
 #[instrument(level = "debug", skip(iface), fields(iface = %iface.name()), err)]
-async fn enter<O: LinuxOps>(iface: &WirelessInterface) -> Result<Holders> {
+async fn enter<O: LinuxOps>(iface: &InterfaceInfo) -> Result<Holders> {
     let name = iface.name();
 
     // 0. Refuse a radio that is already in monitor mode. `rank_candidates`
@@ -299,7 +298,7 @@ async fn enter<O: LinuxOps>(iface: &WirelessInterface) -> Result<Holders> {
 // the channel was not actually applied, so this is a hard error rather than a
 // silent wrong-channel capture.
 async fn set_channel_verified<O: LinuxOps>(
-    iface: &WirelessInterface,
+    iface: &InterfaceInfo,
     freq_mhz: u32,
     width: ChannelWidth,
 ) -> Result<()> {
@@ -343,28 +342,29 @@ async fn set_channel_verified<O: LinuxOps>(
 // reporting 40 MHz with a centre anywhere else is tuned to something the caller
 // did not ask for, so that is `Misaligned` rather than silently accepted as one
 // of the two HT40 variants.
-fn classify_width(actual: ChannelState, primary_mhz: u32) -> WidthReadback {
+fn classify_width(actual: Tuning, primary_mhz: u32) -> WidthReadback {
+    // The common case first, using the same classifier `Tuning::width` exposes
+    // publicly, so a readback the caller can inspect and one this verifies can
+    // never disagree about what the device reported.
+    if let Some(width) = actual.width_at(primary_mhz) {
+        return WidthReadback::Known(width);
+    }
+
+    // Everything below is detail that only an error message needs: `width_at`
+    // has already said "not a width you asked for", and these say why.
     let Some(mhz) = actual.width_mhz else {
         return WidthReadback::None;
     };
-    match mhz {
-        20 => WidthReadback::Known(ChannelWidth::Mhz20),
-        40 => match actual.center_mhz {
-            Some(center) if center == primary_mhz + 10 => {
-                WidthReadback::Known(ChannelWidth::Mhz40Above)
-            }
-            // Written as an addition so a centre below 10 MHz cannot underflow.
-            Some(center) if center + 10 == primary_mhz => {
-                WidthReadback::Known(ChannelWidth::Mhz40Below)
-            }
-            center_mhz => WidthReadback::Misaligned { center_mhz },
-        },
-        mhz => WidthReadback::Other { mhz },
+    if mhz == 40 {
+        return WidthReadback::Misaligned {
+            center_mhz: actual.center_mhz,
+        };
     }
+    WidthReadback::Other { mhz }
 }
 
 // Select the best capture candidate and enter monitor mode on it.
-async fn start_auto_impl<O: LinuxOps>() -> Result<WirelessInterface> {
+async fn start_auto_impl<O: LinuxOps>() -> Result<InterfaceInfo> {
     let interfaces = O::detect().await?;
 
     // Say so when something else is already capturing. Selection silently skips
@@ -377,7 +377,7 @@ async fn start_auto_impl<O: LinuxOps>() -> Result<WirelessInterface> {
     let busy: Vec<&str> = interfaces
         .iter()
         .filter(|iface| iface.is_monitor())
-        .map(WirelessInterface::name)
+        .map(InterfaceInfo::name)
         .collect();
     if !busy.is_empty() {
         warn!(
@@ -428,7 +428,7 @@ async fn start_auto_impl<O: LinuxOps>() -> Result<WirelessInterface> {
 }
 
 // Enter monitor mode on a named interface, skipping selection.
-async fn start_on_impl<O: LinuxOps>(name: &str) -> Result<WirelessInterface> {
+async fn start_on_impl<O: LinuxOps>(name: &str) -> Result<InterfaceInfo> {
     let chosen = find::<O>(name).await?;
     enter::<O>(&chosen).await?;
     Ok(chosen)
@@ -441,7 +441,7 @@ async fn start_on_impl<O: LinuxOps>(name: &str) -> Result<WirelessInterface> {
 // Enter monitor mode on `name` and rename it to `new_name`, rolling the whole
 // session back on any failure so a partially-applied rename never strands the
 // interface (renamed, in monitor, with no guard for the caller).
-async fn start_as_impl<O: LinuxOps>(name: &str, new_name: &str) -> Result<WirelessInterface> {
+async fn start_as_impl<O: LinuxOps>(name: &str, new_name: &str) -> Result<InterfaceInfo> {
     let chosen = find::<O>(name).await?;
     let held = enter::<O>(&chosen).await?;
 
@@ -554,7 +554,7 @@ async fn leave<O: LinuxOps>(name: &str) -> Result<()> {
 
 // Resolve a name to a detected interface, or a rich NotFound listing the ones
 // that do exist.
-async fn find<O: LinuxOps>(name: &str) -> Result<WirelessInterface> {
+async fn find<O: LinuxOps>(name: &str) -> Result<InterfaceInfo> {
     let interfaces = O::detect().await?;
     if interfaces.is_empty() {
         return Err(Error::NoInterfaces);
@@ -671,12 +671,12 @@ mod tests {
     // / `wpa_present` gate the release/reclaim branches; any op named in `fail`
     // errors; and every call appends to `calls` for exact-sequence assertions.
     struct OpsState {
-        interfaces: Vec<WirelessInterface>,
+        interfaces: Vec<InterfaceInfo>,
         read_mode: InterfaceMode,
         // What `read_channel` reports back. Default is un-tuned; tests set it
         // to model a driver that honored the set, one that landed elsewhere, or
         // one that accepted the width and quietly narrowed it.
-        read_channel: ChannelState,
+        read_channel: Tuning,
         nm_present: bool,
         wpa_present: bool,
         fail: Vec<&'static str>,
@@ -695,7 +695,7 @@ mod tests {
             Self {
                 interfaces: Vec::new(),
                 read_mode: InterfaceMode::Monitor,
-                read_channel: ChannelState::UNTUNED,
+                read_channel: Tuning::UNTUNED,
                 nm_present: false,
                 wpa_present: false,
                 fail: Vec::new(),
@@ -738,8 +738,8 @@ mod tests {
         }
     }
 
-    fn iface(name: &str) -> WirelessInterface {
-        WirelessInterface {
+    fn iface(name: &str) -> InterfaceInfo {
+        InterfaceInfo {
             name: name.to_string(),
             index: 1,
             phy_index: 0,
@@ -755,8 +755,8 @@ mod tests {
 
     // The same interface already in monitor mode. `leave` branches on the
     // current mode, so its tests must say which state they start from.
-    fn monitor_iface(name: &str) -> WirelessInterface {
-        WirelessInterface {
+    fn monitor_iface(name: &str) -> InterfaceInfo {
+        InterfaceInfo {
             mode: InterfaceMode::Monitor,
             ..iface(name)
         }
@@ -765,11 +765,11 @@ mod tests {
     struct MockOps;
 
     impl LinuxOps for MockOps {
-        async fn detect() -> Result<Vec<WirelessInterface>> {
+        async fn detect() -> Result<Vec<InterfaceInfo>> {
             record("detect");
             Ok(ops().interfaces.clone())
         }
-        async fn set_mode(iface: &WirelessInterface, mode: InterfaceMode) -> Result<()> {
+        async fn set_mode(iface: &InterfaceInfo, mode: InterfaceMode) -> Result<()> {
             record(format!("set_mode {} {mode}", iface.name()));
             let refuses = ops().fail_set_mode_on.iter().any(|n| n == iface.name());
             if refuses {
@@ -788,14 +788,14 @@ mod tests {
             Ok(ops().read_mode)
         }
         async fn set_freq(
-            iface: &WirelessInterface,
+            iface: &InterfaceInfo,
             freq_mhz: u32,
             _width: ChannelWidth,
         ) -> Result<()> {
             record(format!("set_freq {} {freq_mhz}", iface.name()));
             gate("set_freq")
         }
-        async fn read_channel(_index: u32) -> Result<ChannelState> {
+        async fn read_channel(_index: u32) -> Result<Tuning> {
             record("read_channel");
             gate("read_channel")?;
             Ok(ops().read_channel)
@@ -1248,19 +1248,19 @@ mod tests {
     // --- set_channel verification ---
 
     // A readback for a driver that honoured the request exactly.
-    fn honoured(freq_mhz: u32, width: ChannelWidth) -> ChannelState {
+    fn honoured(freq_mhz: u32, width: ChannelWidth) -> Tuning {
         match width {
-            ChannelWidth::Mhz20 => ChannelState {
+            ChannelWidth::Mhz20 => Tuning {
                 freq_mhz: Some(freq_mhz),
                 width_mhz: Some(20),
                 center_mhz: Some(freq_mhz),
             },
-            ChannelWidth::Mhz40Above => ChannelState {
+            ChannelWidth::Mhz40Above => Tuning {
                 freq_mhz: Some(freq_mhz),
                 width_mhz: Some(40),
                 center_mhz: Some(freq_mhz + 10),
             },
-            ChannelWidth::Mhz40Below => ChannelState {
+            ChannelWidth::Mhz40Below => Tuning {
                 freq_mhz: Some(freq_mhz),
                 width_mhz: Some(40),
                 center_mhz: Some(freq_mhz - 10),
@@ -1329,7 +1329,7 @@ mod tests {
     async fn set_channel_errors_when_the_segment_centre_is_misaligned() {
         let _scope = ops_scope();
         // 40 MHz at a centre that is neither primary +10 nor -10.
-        ops().read_channel = ChannelState {
+        ops().read_channel = Tuning {
             freq_mhz: Some(5180),
             width_mhz: Some(40),
             center_mhz: Some(5210),
@@ -1352,7 +1352,7 @@ mod tests {
     async fn set_channel_errors_when_the_width_is_wider_than_requested() {
         let _scope = ops_scope();
         // Something else left the device at 80 MHz and the set did not narrow it.
-        ops().read_channel = ChannelState {
+        ops().read_channel = Tuning {
             freq_mhz: Some(5180),
             width_mhz: Some(80),
             center_mhz: Some(5210),
@@ -1374,7 +1374,7 @@ mod tests {
         let _scope = ops_scope();
         // nl80211 distinguishes 20_NOHT from 20; both are 20 MHz for our
         // purposes, and demanding the exact variant would fail honoured sets.
-        ops().read_channel = ChannelState {
+        ops().read_channel = Tuning {
             freq_mhz: Some(2412),
             width_mhz: Some(20),
             center_mhz: None,
@@ -1405,7 +1405,7 @@ mod tests {
     #[tokio::test]
     async fn set_channel_errors_when_untuned() {
         let _scope = ops_scope();
-        ops().read_channel = ChannelState::UNTUNED; // reports untuned after the set
+        ops().read_channel = Tuning::UNTUNED; // reports untuned after the set
         let err = set_channel_verified::<MockOps>(&iface("wlan0"), 5180, ChannelWidth::Mhz20)
             .await
             .unwrap_err();

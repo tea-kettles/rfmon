@@ -175,7 +175,7 @@ async fn stop_all() -> Result<(), CliError> {
 // Read-only, and the only command that does not need root, since the nl80211 dumps
 // behind `detect` are readable by any user.
 async fn list() -> Result<(), CliError> {
-    let interfaces = rfmon::WirelessInterface::detect().await?;
+    let interfaces = rfmon::InterfaceInfo::detect().await?;
     if interfaces.is_empty() {
         println!("no wireless interfaces found");
         return Ok(());
@@ -235,7 +235,7 @@ async fn list() -> Result<(), CliError> {
 
 // How the library sees this interface's monitor capability, in the same three
 // tiers selection uses.
-fn monitor_support(iface: &rfmon::WirelessInterface) -> &'static str {
+fn monitor_support(iface: &rfmon::InterfaceInfo) -> &'static str {
     if iface.supports_monitor() {
         "advertised over nl80211"
     } else if iface.is_monitor_plausible() {

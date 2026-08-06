@@ -14,7 +14,7 @@ The interface is switched in place, so no `wlan0mon` clone appears (but it can i
 | Windows | Compile only stub that'll be filled out later. Native Windows exposes no 802.11 monitor mode, so calls return `WindowsError::Unsupported`. An Npcap backed backend is the intended path. |
 | Mac | Planned but no promises |
 
-Every operation that changes an interface requires `CAP_NET_ADMIN`, most easily obtained by running as root. Enumeration (`WirelessInterface::detect` and the CLI's `list`) reads the nl80211 dumps any user can read, so it needs no privileges.
+Every operation that changes an interface requires `CAP_NET_ADMIN`, most easily obtained by running as root. Enumeration (`InterfaceInfo::detect` and the CLI's `list`) reads the nl80211 dumps any user can read, so it needs no privileges.
 
 ## Install
 
@@ -38,14 +38,16 @@ cargo build --features cli   # -> target/debug/rfmon
 ```rust
 #[tokio::main]
 async fn main() -> rfmon::Result<()> {
-    // Select the best monitor capable radio and enter monitor mode.
-    let mon = rfmon::start_monitor().await?;
-
-    // Park on a channel. 2.4 GHz is 1 to 14, 5 GHz is 32 to 177. Tuning through
-    // the guard reuses the interface it resolved, so hops are cheap and verified.
-    mon.set_channel(36).await?;
+    // Select the best monitor capable radio, enter monitor mode, and park on
+    // channel 36. Nothing touches the hardware until the await; the mode switch
+    // and the channel are both read back and verified before this returns.
+    let mon = rfmon::start_monitor().on_channel(36).await?;
 
     // Capture raw 802.11 frames on `mon.name()` with pcap or AF_PACKET.
+
+    // Hop. Tuning through the guard reuses the interface it already resolved,
+    // so this is one verified set rather than a re-scan of every radio.
+    mon.set_channel(11).await?;
 
     // Restore managed networking. Also happens on drop.
     mon.restore().await?;
@@ -60,13 +62,58 @@ async fn main() -> rfmon::Result<()> {
 | `start_monitor()` | Select the best radio, enter monitor mode. |
 | `start_monitor_on(iface)` | Enter monitor mode on a named interface. |
 | `start_monitor_as(iface, new)` | Enter monitor mode, then rename the interface. |
+| `.on_channel(chan)` | On any of the three above: park on a channel as part of the same call. |
 | `set_channel(iface, chan)` | Tune a 2.4 or 5 GHz channel. Takes `.with_width(..)`. |
 | `set_channel_6g(iface, chan)` | Tune a 6 GHz channel. Same builder, different band. |
 | `stop_monitor(iface)` | Restore one interface to managed networking, by name. |
 | `stop_all_monitors()` | Restore every monitor mode interface, best effort. |
-| `WirelessInterface::detect()` | Enumerate interfaces and their capabilities: modes, bands, channels. |
+| `InterfaceInfo::detect()` | Enumerate every interface with its capabilities: modes, bands, channels. |
+| `InterfaceInfo::lookup(iface)` | The same enumeration, filtered to one name. |
 
-The three `start_*` calls return a [`MonitorGuard`](#cleanup). `stop_monitor` and `stop_all_monitors` are stateless and name based, for the cases a guard cannot cover. Everything is fallible and returns `Result`; nothing in the library panics on hardware state.
+The three `start_*` calls return a `MonitorBuilder`, which does nothing until awaited and then yields the [`MonitorGuard`](#cleanup) that owns the session. `stop_monitor` and `stop_all_monitors` are stateless and name based, for the cases a guard cannot cover. Everything is fallible and returns `Result`; nothing in the library panics on hardware state.
+
+### The model
+
+Two types, and interface names as the currency between them.
+
+| | what it is | how you get one | cost of a getter |
+|---|---|---|---|
+| `InterfaceInfo` | a snapshot of one radio's facts | `detect()`, `lookup(name)` | free; it is already in hand |
+| `MonitorGuard` | an owned monitor session | awaiting any `start_*` | free for static facts, one kernel read for live state |
+
+`InterfaceInfo` is a photograph, not a handle. It carries the MAC, bands, channels, driver, bus, and what the interface was doing when the dump ran, and it does not track the interface afterwards: `is_monitor()` tells you what was true at enumeration time, so re-read it if that matters. Both ways of getting one are a full nl80211 dump under the hood, which any user can read, so neither needs root. `lookup` is `detect` plus a filter and a better error, not a cheaper path, so hold the result rather than calling it per field, and use `detect()` with your own filter when you are looking at several interfaces.
+
+`MonitorGuard` is the opposite: it owns the interface and restores it on drop. It holds the snapshot it started from, and reads live state on request, which is the one thing a snapshot cannot honestly carry:
+
+```rust
+let mon = rfmon::start_monitor().on_channel(36).await?;
+
+mon.name();                  // current name, rename aware
+mon.info().mac();            // static facts, free
+mon.tuning().await?;         // live: frequency, channel and width in one read
+mon.channel().await?;        // -> Some(36)
+```
+
+Nothing is cached on the way back. Everything the library reports about a live interface is read from the kernel at the moment you ask, for the same reason every set is verified: a driver that accepts a request and quietly ignores it is the failure this crate exists to catch, and a struct field remembering what you *asked for* would hide exactly that.
+
+Interface **names** are what pass between the two, and what every entry point takes. A name is also the only one of the three that survives your process being killed, which is why `stop_monitor` takes one rather than an object. See [Recovery](#recovery).
+
+### Starting a session
+
+The builder exists so a session can be fully specified in one statement. `.on_channel(n)` (or `.on_channel_6g(n)`, plus `.with_width(..)`) applies the channel once monitor mode has been confirmed, so the same verified path runs without a second round trip:
+
+```rust
+let mon = rfmon::start_monitor().on_channel(36).await?;
+
+let mon = rfmon::start_monitor_as("wlan0", "mon0")
+    .on_channel(149)
+    .with_width(ChannelWidth::Mhz40Above)
+    .await?;
+```
+
+Configuring the channel here rather than afterwards also closes a window: a session started and then tuned is briefly live on whatever channel the driver happened to leave the radio on.
+
+If the channel cannot be resolved, or the tune fails its readback, the session is torn back down (rename undone, managed mode restored, interface handed back) and the channel error is returned. No guard comes back parked on a channel you did not ask for, which is the same reasoning behind verifying the set at all.
 
 ### Interface selection
 
@@ -137,7 +184,7 @@ mon.set_channel_6g(37).await?;         // 6 GHz counterpart, same guard
 
 ### Cleanup
 
-The `start_*` calls return a guard that owns the session:
+Awaiting any of the `start_*` calls yields a guard that owns the session:
 
 - `guard.restore().await` is the reliable teardown. It renames back where applicable, restores managed networking, and returns a `Result`.
 - Drop is the safety net. Rust has no async drop, so the restore is run to completion on a dedicated thread and blocks. This covers normal scope exit, `?` early returns, task cancellation, and panic unwinding.

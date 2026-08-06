@@ -2,7 +2,7 @@
 //!
 //! Every other example demonstrates one call. This one drives all of them in
 //! sequence and *independently verifies* each outcome with a fresh
-//! `WirelessInterface::detect()`, rather than trusting the value a call
+//! `InterfaceInfo::detect()`, rather than trusting the value a call
 //! returned. A call that reports success while the kernel disagrees is exactly
 //! the failure mode this library exists to defend against, so the check has to
 //! come from outside the call.
@@ -34,7 +34,7 @@
 use std::time::Duration;
 
 use rfmon::{
-    BandKind, ChannelWidth, Error, InterfaceMode, MonitorGuard, WirelessInterface, channel_from_mhz,
+    BandKind, ChannelWidth, Error, InterfaceInfo, InterfaceMode, MonitorGuard, channel_from_mhz,
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -127,13 +127,14 @@ async fn run(report: &mut Report, target: Option<String>) -> rfmon::Result<()> {
     let was_associated = interfaces
         .iter()
         .find(|i| i.name() == target)
-        .is_some_and(WirelessInterface::is_associated);
+        .is_some_and(InterfaceInfo::is_associated);
     phase_3_error_paths(report).await;
 
     // Everything past here mutates the interface.
     phase_4_enter(report, &target).await?;
     phase_5_soak(report, &target).await?;
     phase_6_tuning(report, &target).await?;
+    phase_6b_builder_chain(report, &target).await?;
     phase_7_channel_errors(report, &target).await?;
     phase_8_rename(report, &target).await?;
     phase_9_persist_and_stop(report, &target).await?;
@@ -145,9 +146,9 @@ async fn run(report: &mut Report, target: Option<String>) -> rfmon::Result<()> {
 
 // Enumerate and report what the box has. Also the read-path smoke test: a
 // malformed nl80211 join shows up here as a missing band or a zero MAC.
-async fn phase_1_detect(report: &mut Report) -> rfmon::Result<Vec<WirelessInterface>> {
+async fn phase_1_detect(report: &mut Report) -> rfmon::Result<Vec<InterfaceInfo>> {
     banner("1", "detect");
-    let interfaces = WirelessInterface::detect().await?;
+    let interfaces = InterfaceInfo::detect().await?;
     report.check(
         "detect returns at least one interface",
         !interfaces.is_empty(),
@@ -226,7 +227,7 @@ async fn phase_1_detect(report: &mut Report) -> rfmon::Result<Vec<WirelessInterf
 fn phase_2_select(
     report: &mut Report,
     requested: Option<String>,
-    interfaces: &[WirelessInterface],
+    interfaces: &[InterfaceInfo],
 ) -> rfmon::Result<String> {
     banner("2", "selection");
 
@@ -235,7 +236,7 @@ fn phase_2_select(
     // Mirrors the library's own rule: a radio already in monitor mode belongs to
     // something else, and every `start_*` call refuses it. Selecting one here
     // would abort the suite in phase 4 rather than testing anything.
-    let mut ranked: Vec<&WirelessInterface> = interfaces
+    let mut ranked: Vec<&InterfaceInfo> = interfaces
         .iter()
         .filter(|i| i.is_monitor_plausible() && !i.is_monitor())
         .collect();
@@ -278,7 +279,7 @@ fn phase_2_select(
                 name: name.clone(),
                 available: interfaces
                     .iter()
-                    .map(WirelessInterface::name)
+                    .map(InterfaceInfo::name)
                     .collect::<Vec<_>>()
                     .join(", "),
             })?,
@@ -426,7 +427,7 @@ async fn phase_6_tuning(report: &mut Report, target: &str) -> rfmon::Result<()> 
     // the documented recovery order: stop, then start.
     rfmon::stop_monitor(target).await?;
 
-    let iface = require(target).await?;
+    let iface = InterfaceInfo::lookup(target).await?;
     let guard = rfmon::start_monitor_on(target).await?;
 
     for band in [BandKind::TwoGhz, BandKind::FiveGhz] {
@@ -492,11 +493,67 @@ async fn phase_6_tuning(report: &mut Report, target: &str) -> rfmon::Result<()> 
     Ok(())
 }
 
+// The builder path: enter and tune in one call, and the rollback that fires
+// when the tune fails after the mode switch already succeeded.
+async fn phase_6b_builder_chain(report: &mut Report, target: &str) -> rfmon::Result<()> {
+    banner("6b", "builder chain");
+
+    // Start from managed: entering is refused on a radio already in monitor.
+    rfmon::stop_monitor(target).await?;
+    let iface = InterfaceInfo::lookup(target).await?;
+
+    match tunable_channel(&iface, BandKind::TwoGhz).or_else(|| {
+        // 2.4 GHz is the common case, but a 5 GHz-only adapter still has a
+        // channel to prove the chain with.
+        tunable_channel(&iface, BandKind::FiveGhz)
+    }) {
+        Some(channel) => {
+            let guard = rfmon::start_monitor_on(target).on_channel(channel).await?;
+            report.check("builder chain returns a guard", guard.name() == target);
+            // An `Ok` here already means the channel was read back and matched:
+            // the builder runs the same verified set the free call does, so a
+            // driver that ignored the request would have surfaced as an error
+            // rather than a guard.
+            report.check(
+                "builder chain leaves the interface in monitor mode",
+                mode_of(target).await? == Some(InterfaceMode::Monitor),
+            );
+            guard.restore().await?;
+        }
+        None => report.skip(
+            "builder chain tunes on entry",
+            "no usable 2.4 or 5 GHz channel",
+        ),
+    }
+
+    // The rollback. A channel no band carries fails resolution *after* the mode
+    // switch has already been made, which is the whole reason the builder tears
+    // the session down: without it the caller would be handed a monitor
+    // interface parked wherever the driver left it.
+    let absent = (1..=255).find(|c| !has_channel(&iface, *c)).unwrap_or(255);
+    report.check(
+        &format!("builder chain on absent channel {absent} errors"),
+        matches!(
+            rfmon::start_monitor_on(target).on_channel(absent).await,
+            Err(Error::ChannelUnavailable { .. })
+        ),
+    );
+    // The property that matters: the failure left nothing behind.
+    report.check(
+        "a failed builder chain leaves the interface in managed mode",
+        mode_of(target).await? == Some(InterfaceMode::Managed),
+    );
+
+    // Hand the next phase the same state phase 6 used to leave it in.
+    rfmon::start_monitor_on(target).await?.persist();
+    Ok(())
+}
+
 // Channel resolution failures, which need the interface in hand but change
 // nothing when they fire.
 async fn phase_7_channel_errors(report: &mut Report, target: &str) -> rfmon::Result<()> {
     banner("7", "channel errors");
-    let iface = require(target).await?;
+    let iface = InterfaceInfo::lookup(target).await?;
 
     // A channel number no band on this device carries.
     let absent = (1..=255).find(|c| !has_channel(&iface, *c)).unwrap_or(255);
@@ -650,7 +707,7 @@ async fn phase_11_stop_all(report: &mut Report, target: &str) -> rfmon::Result<(
         mode_of(target).await? == Some(InterfaceMode::Monitor),
     );
 
-    let before = WirelessInterface::detect().await?;
+    let before = InterfaceInfo::detect().await?;
     let managed_before: Vec<String> = before
         .iter()
         .filter(|i| !i.is_monitor())
@@ -664,7 +721,7 @@ async fn phase_11_stop_all(report: &mut Report, target: &str) -> rfmon::Result<(
         "sweep reported the target as restored",
         restored.iter().any(|name| name == target),
     );
-    let after = WirelessInterface::detect().await?;
+    let after = InterfaceInfo::detect().await?;
     report.check(
         "no interface is left in monitor mode",
         after.iter().all(|i| !i.is_monitor()),
@@ -692,7 +749,7 @@ async fn phase_12_final_audit(
 ) -> rfmon::Result<()> {
     banner("12", "final audit");
 
-    let iface = require(target).await?;
+    let iface = InterfaceInfo::lookup(target).await?;
     report.check(
         "target is back under its original name",
         iface.name() == target,
@@ -723,33 +780,16 @@ async fn phase_12_final_audit(
 
 // The current mode of `name`, or `None` if no interface has that name.
 async fn mode_of(name: &str) -> rfmon::Result<Option<InterfaceMode>> {
-    Ok(WirelessInterface::detect()
+    Ok(InterfaceInfo::detect()
         .await?
         .into_iter()
         .find(|i| i.name() == name)
         .map(|i| i.mode()))
 }
 
-// Resolve `name` or fail with the library's own NotFound.
-async fn require(name: &str) -> rfmon::Result<WirelessInterface> {
-    let interfaces = WirelessInterface::detect().await?;
-    let available = interfaces
-        .iter()
-        .map(WirelessInterface::name)
-        .collect::<Vec<_>>()
-        .join(", ");
-    interfaces
-        .into_iter()
-        .find(|i| i.name() == name)
-        .ok_or(Error::NotFound {
-            name: name.to_string(),
-            available,
-        })
-}
-
 // A channel that is usable in `band`: present, enabled, not radar (a DFS
 // channel can take seconds to become usable and is not what we are testing).
-fn tunable_channel(iface: &WirelessInterface, band: BandKind) -> Option<u32> {
+fn tunable_channel(iface: &InterfaceInfo, band: BandKind) -> Option<u32> {
     iface
         .bands()
         .iter()
@@ -779,7 +819,7 @@ fn is_verify_failure(_error: &Error) -> bool {
 // `set_channel` searches. Channels that are enabled *anywhere* are excluded: at
 // 2.4/5 GHz they would simply resolve, and at 6 GHz they would report
 // `WrongBand`, which outranks the regulatory answer.
-fn disabled_channel(iface: &WirelessInterface) -> Option<u32> {
+fn disabled_channel(iface: &InterfaceInfo) -> Option<u32> {
     iface
         .bands()
         .iter()
@@ -790,17 +830,17 @@ fn disabled_channel(iface: &WirelessInterface) -> Option<u32> {
         .find(|channel| !has_enabled_channel(iface, *channel))
 }
 
-fn has_enabled_channel(iface: &WirelessInterface, channel: u32) -> bool {
+fn has_enabled_channel(iface: &InterfaceInfo, channel: u32) -> bool {
     iface
         .frequencies()
         .any(|freq| freq.channel() == Some(channel) && !freq.is_disabled())
 }
 
-fn has_channel(iface: &WirelessInterface, channel: u32) -> bool {
+fn has_channel(iface: &InterfaceInfo, channel: u32) -> bool {
     iface.frequencies().any(|f| f.channel() == Some(channel))
 }
 
-fn has_channel_in(iface: &WirelessInterface, channel: u32, band: BandKind) -> bool {
+fn has_channel_in(iface: &InterfaceInfo, channel: u32, band: BandKind) -> bool {
     iface
         .bands()
         .iter()

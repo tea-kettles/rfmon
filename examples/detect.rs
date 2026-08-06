@@ -3,7 +3,7 @@
 //! Run with: `cargo run --example detect`
 //! Adjust verbosity with `RUST_LOG` (e.g. `RUST_LOG=rfmon=trace`).
 
-use rfmon::WirelessInterface;
+use rfmon::InterfaceInfo;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> rfmon::Result<()> {
     init_tracing();
 
-    let interfaces = WirelessInterface::detect().await?;
+    let interfaces = InterfaceInfo::detect().await?;
     if interfaces.is_empty() {
         info!("no wireless interfaces found");
         return Ok(());

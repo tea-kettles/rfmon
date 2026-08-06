@@ -11,7 +11,8 @@
 //!   * [`start_monitor_as`]: enter monitor mode and rename the interface.
 //!   * [`stop_monitor`]: the stateless, name-based recovery path.
 //!
-//! The three `start_*` functions return a [`MonitorGuard`] whose scope owns the
+//! The three `start_*` functions return a [`MonitorBuilder`], which does nothing
+//! until it is awaited and then yields a [`MonitorGuard`] whose scope owns the
 //! session: it restores managed networking when it drops (or via
 //! [`MonitorGuard::restore`]). [`stop_monitor`] exists for the cases a guard
 //! cannot cover: cleaning up an interface by name across process boundaries,
@@ -27,7 +28,7 @@ use std::pin::Pin;
 use tracing::warn;
 
 use crate::cleanup::MonitorGuard;
-use crate::interface::{BandScope, ChannelWidth, WirelessInterface, resolve_frequency};
+use crate::interface::{BandScope, ChannelWidth, InterfaceInfo, Tuning, resolve_frequency};
 use crate::{Error, Result};
 
 /* Backend selection */
@@ -58,32 +59,34 @@ use tests::MockBackend as Backend;
 #[allow(async_fn_in_trait)]
 pub(crate) trait MonitorBackend {
     /// Enumerate all wireless interfaces with their device capabilities.
-    async fn detect() -> Result<Vec<WirelessInterface>>;
+    async fn detect() -> Result<Vec<InterfaceInfo>>;
 
     /// Select the best capable interface and put it into monitor mode.
     ///
     /// Returns the interface that was activated. Errors if no interface is
     /// present ([`crate::Error::NoInterfaces`]) or none are monitor-capable
     /// ([`crate::Error::NoMonitorCapable`]).
-    async fn start_auto() -> Result<WirelessInterface>;
+    async fn start_auto() -> Result<InterfaceInfo>;
 
     /// Put a specific named interface into monitor mode, skipping selection.
-    async fn start_on(name: &str) -> Result<WirelessInterface>;
+    async fn start_on(name: &str) -> Result<InterfaceInfo>;
 
     /// Put a named interface into monitor mode and rename it to `new_name`.
     ///
     /// Returns the interface under its new name.
-    async fn start_as(name: &str, new_name: &str) -> Result<WirelessInterface>;
+    async fn start_as(name: &str, new_name: &str) -> Result<InterfaceInfo>;
 
     /// Rename an interface (e.g. back to its original name during teardown).
     async fn rename(current: &str, new: &str) -> Result<()>;
 
     /// Set the operating channel of a monitor-mode interface.
-    async fn set_channel(
-        iface: &WirelessInterface,
-        freq_mhz: u32,
-        width: ChannelWidth,
-    ) -> Result<()>;
+    async fn set_channel(iface: &InterfaceInfo, freq_mhz: u32, width: ChannelWidth) -> Result<()>;
+
+    /// Read back the channel an interface is currently sitting on.
+    ///
+    /// Live state, so this always reaches the OS rather than reporting anything
+    /// carried from an earlier enumeration.
+    async fn read_tuning(iface: &InterfaceInfo) -> Result<Tuning>;
 
     /// Take a named interface out of monitor mode and restore managed
     /// networking (returning control to NetworkManager / wpa_supplicant).
@@ -93,15 +96,17 @@ pub(crate) trait MonitorBackend {
 /* Public API */
 
 /// Automatically select the best monitor-capable interface and enter monitor
-/// mode, returning an RAII [`MonitorGuard`].
+/// mode.
 ///
-/// Uses the scoring in [`WirelessInterface::monitor_score`] to pick the most
+/// Uses the scoring in [`InterfaceInfo::monitor_score`] to pick the most
 /// suitable radio: a known monitor-capable USB adapter that is idle outranks
 /// the built-in card carrying the host's connection.
 ///
-/// The returned guard restores managed networking when it drops (or via
-/// [`MonitorGuard::restore`]); read the chosen interface with
-/// [`MonitorGuard::name`]. Requires `CAP_NET_ADMIN` (root).
+/// Returns a [`MonitorBuilder`], which does nothing until awaited and then
+/// yields an RAII [`MonitorGuard`]. The guard restores managed networking when
+/// it drops (or via [`MonitorGuard::restore`]); read the chosen interface with
+/// [`MonitorGuard::name`]. Park on a channel in the same statement with
+/// [`on_channel`](MonitorBuilder::on_channel). Requires `CAP_NET_ADMIN` (root).
 ///
 /// # Errors
 ///
@@ -129,16 +134,20 @@ pub(crate) trait MonitorBackend {
 /// # async fn main() -> rfmon::Result<()> {
 /// let mon = rfmon::start_monitor().await?;
 /// println!("monitoring on {}", mon.name());
+///
+/// // Or select, enter, and tune in one statement.
+/// let mon = rfmon::start_monitor().on_channel(6).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub async fn start_monitor() -> Result<MonitorGuard> {
-    start_monitor_with::<Backend>().await
+pub fn start_monitor() -> MonitorBuilder {
+    MonitorBuilder::new(StartTarget::Auto)
 }
 
 /// Enter monitor mode on a specific interface by name, skipping scoring.
 ///
-/// Returns an RAII [`MonitorGuard`] that restores managed networking when it
+/// Returns a [`MonitorBuilder`], which does nothing until awaited and then
+/// yields an RAII [`MonitorGuard`] that restores managed networking when it
 /// drops (or via [`MonitorGuard::restore`]). Requires `CAP_NET_ADMIN` (root).
 ///
 /// # Errors
@@ -158,8 +167,8 @@ pub async fn start_monitor() -> Result<MonitorGuard> {
 /// # Ok(())
 /// # }
 /// ```
-pub async fn start_monitor_on(name: &str) -> Result<MonitorGuard> {
-    start_monitor_on_with::<Backend>(name).await
+pub fn start_monitor_on(name: &str) -> MonitorBuilder {
+    MonitorBuilder::new(StartTarget::Named(name.to_string()))
 }
 
 /// Leave monitor mode on `name` and return the interface to managed networking.
@@ -225,7 +234,8 @@ pub async fn stop_all_monitors() -> Result<Vec<String>> {
 }
 
 /// Enter monitor mode on `name` and rename the interface to `new_name`,
-/// returning an RAII [`MonitorGuard`].
+/// returning a [`MonitorBuilder`] that yields an RAII [`MonitorGuard`] when
+/// awaited.
 ///
 /// Unlike airmon-ng (which creates a second `…mon` interface), rfmon switches
 /// the existing device in place, so without this it simply keeps its original
@@ -252,8 +262,11 @@ pub async fn stop_all_monitors() -> Result<Vec<String>> {
 /// # Ok(())
 /// # }
 /// ```
-pub async fn start_monitor_as(name: &str, new_name: &str) -> Result<MonitorGuard> {
-    start_monitor_as_with::<Backend>(name, new_name).await
+pub fn start_monitor_as(name: &str, new_name: &str) -> MonitorBuilder {
+    MonitorBuilder::new(StartTarget::Renamed {
+        name: name.to_string(),
+        new_name: new_name.to_string(),
+    })
 }
 
 /// Set the operating channel of a monitor-mode interface, on 2.4 or 5 GHz.
@@ -320,6 +333,61 @@ pub fn set_channel_6g(iface: &str, channel: u32) -> SetChannel {
 
 /* Types */
 
+/// A pending monitor-mode session, produced by [`start_monitor`],
+/// [`start_monitor_on`], or [`start_monitor_as`].
+///
+/// Nothing has touched the hardware yet: no interface has been released from
+/// its network manager, no mode has been switched, nothing has been verified.
+/// Awaiting the builder does all of that and yields the [`MonitorGuard`] that
+/// owns the session.
+///
+/// Optionally park the interface on a channel in the same statement with
+/// [`on_channel`](Self::on_channel) or [`on_channel_6g`](Self::on_channel_6g),
+/// which saves a second round trip and, more importantly, means the session is
+/// never briefly live on whatever channel the driver happened to leave it on:
+///
+/// ```no_run
+/// use rfmon::ChannelWidth;
+///
+/// # #[tokio::main]
+/// # async fn main() -> rfmon::Result<()> {
+/// let mon = rfmon::start_monitor()
+///     .on_channel(36)
+///     .with_width(ChannelWidth::Mhz40Above)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// If the channel set fails, the session is torn back down and the error
+/// returned, rather than handing back a guard parked somewhere the caller did
+/// not ask for. See [`on_channel`](Self::on_channel).
+#[derive(Debug)]
+#[must_use = "a monitor session is not started until the builder is awaited"]
+pub struct MonitorBuilder {
+    target: StartTarget,
+    // The channel to park on once monitor mode is confirmed, carrying the band
+    // scope fixed by which `on_channel*` call set it. `None` leaves the
+    // interface wherever the driver left it, which is what a caller who only
+    // wants the mode switch gets.
+    channel: Option<(u32, BandScope)>,
+    width: ChannelWidth,
+}
+
+// Which interface a pending session targets, and under what name. One variant
+// per `start_*` entry point, so the choice of entry point is carried as data
+// until the builder is awaited rather than being baked into three separate
+// futures.
+#[derive(Debug)]
+enum StartTarget {
+    // Score every interface and take the best capture candidate.
+    Auto,
+    // A named interface, skipping scoring.
+    Named(String),
+    // A named interface, renamed to `new_name` for the life of the session.
+    Renamed { name: String, new_name: String },
+}
+
 /// A pending [`set_channel`] or [`set_channel_6g`] call.
 ///
 /// Configure it with [`with_width`](Self::with_width), then `.await` it.
@@ -343,7 +411,106 @@ pub struct SetChannel {
 #[derive(Debug)]
 enum Target {
     ByName(String),
-    Resolved(Box<WirelessInterface>),
+    Resolved(Box<InterfaceInfo>),
+}
+
+impl MonitorBuilder {
+    fn new(target: StartTarget) -> Self {
+        Self {
+            target,
+            channel: None,
+            width: ChannelWidth::Mhz20,
+        }
+    }
+
+    /// Park the interface on a 2.4 or 5 GHz channel once monitor mode is
+    /// confirmed.
+    ///
+    /// The channel is resolved and applied exactly as
+    /// [`MonitorGuard::set_channel`] would, verified frequency and width
+    /// included, but without a second statement or a second interface lookup.
+    ///
+    /// Named `on_channel` rather than `set_channel` because it configures a
+    /// session that has not started yet; nothing is tuned until the builder is
+    /// awaited. 6 GHz is not searched here, for the reason
+    /// [`set_channel`] explains: use
+    /// [`on_channel_6g`](Self::on_channel_6g).
+    ///
+    /// # Errors
+    ///
+    /// If the channel cannot be resolved or the tune fails verification, the
+    /// session is rolled back (managed mode restored, rename undone, interface
+    /// handed back) and the channel error is returned. A guard is never
+    /// returned parked on a channel other than the one requested: that is the
+    /// silent wrong-channel capture the verified set exists to prevent.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> rfmon::Result<()> {
+    /// let mon = rfmon::start_monitor_on("wlan0").on_channel(11).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn on_channel(mut self, channel: u32) -> Self {
+        self.channel = Some((channel, BandScope::ExceptSixGhz));
+        self
+    }
+
+    /// Park the interface on a 6 GHz channel once monitor mode is confirmed.
+    ///
+    /// The 6 GHz counterpart to [`on_channel`](Self::on_channel), identical but
+    /// for the band it searches. Calling both keeps the last one.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> rfmon::Result<()> {
+    /// let mon = rfmon::start_monitor().on_channel_6g(37).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn on_channel_6g(mut self, channel: u32) -> Self {
+        self.channel = Some((channel, BandScope::SixGhzOnly));
+        self
+    }
+
+    /// Set the bandwidth for the channel this builder will park on (default
+    /// [`ChannelWidth::Mhz20`]).
+    ///
+    /// Has no effect without an [`on_channel`](Self::on_channel) or
+    /// [`on_channel_6g`](Self::on_channel_6g), since there is then no channel
+    /// set for it to apply to.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rfmon::ChannelWidth;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> rfmon::Result<()> {
+    /// let mon = rfmon::start_monitor()
+    ///     .on_channel(36)
+    ///     .with_width(ChannelWidth::Mhz40Above)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_width(mut self, width: ChannelWidth) -> Self {
+        self.width = width;
+        self
+    }
+}
+
+impl IntoFuture for MonitorBuilder {
+    type Output = Result<MonitorGuard>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Result<MonitorGuard>> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(start_with::<Backend>(self))
+    }
 }
 
 impl SetChannel {
@@ -358,7 +525,7 @@ impl SetChannel {
     }
 
     // Construction for the guard methods, which already hold the interface.
-    pub(crate) fn from_iface(iface: WirelessInterface, channel: u32, scope: BandScope) -> Self {
+    pub(crate) fn from_iface(iface: InterfaceInfo, channel: u32, scope: BandScope) -> Self {
         Self {
             target: Target::Resolved(Box::new(iface)),
             channel,
@@ -405,9 +572,14 @@ impl IntoFuture for SetChannel {
 
 /* Free functions */
 
-// Backend interface enumeration, exposed to `WirelessInterface::detect`.
-pub(crate) async fn detect() -> Result<Vec<WirelessInterface>> {
+// Backend interface enumeration, exposed to `InterfaceInfo::detect`.
+pub(crate) async fn detect() -> Result<Vec<InterfaceInfo>> {
     Backend::detect().await
+}
+
+// Live channel readback, backing `MonitorGuard::tuning`.
+pub(crate) async fn read_tuning(iface: &InterfaceInfo) -> Result<Tuning> {
+    Backend::read_tuning(iface).await
 }
 
 // Restore a possibly-renamed interface: rename it back to `original` (when it
@@ -424,23 +596,54 @@ pub(crate) async fn restore_named(current: &str, original: &str) -> Result<Strin
 // exercised against a mock `MonitorBackend` in tests without touching hardware.
 // Everything platform-specific stays below the trait, inside each backend.
 
-async fn start_monitor_with<B: MonitorBackend>() -> Result<MonitorGuard> {
-    let iface = B::start_auto().await?;
-    Ok(MonitorGuard::new(iface))
-}
+async fn start_with<B: MonitorBackend>(request: MonitorBuilder) -> Result<MonitorGuard> {
+    let guard = match request.target {
+        StartTarget::Auto => MonitorGuard::new(B::start_auto().await?),
+        StartTarget::Named(name) => MonitorGuard::new(B::start_on(&name).await?),
+        StartTarget::Renamed { name, new_name } => {
+            // Validated before the backend is touched: a malformed name is the
+            // caller's mistake and costs nothing to catch, whereas discovering
+            // it from a failed rename means an interface was switched into
+            // monitor mode only to be rolled straight back out.
+            crate::interface::validate_iface_name(&new_name)?;
+            let iface = B::start_as(&name, &new_name).await?;
+            MonitorGuard::from_rename(name, iface)
+        }
+    };
 
-async fn start_monitor_on_with<B: MonitorBackend>(name: &str) -> Result<MonitorGuard> {
-    let iface = B::start_on(name).await?;
-    Ok(MonitorGuard::new(iface))
-}
+    let Some((channel, scope)) = request.channel else {
+        return Ok(guard);
+    };
 
-async fn start_monitor_as_with<B: MonitorBackend>(
-    name: &str,
-    new_name: &str,
-) -> Result<MonitorGuard> {
-    crate::interface::validate_iface_name(new_name)?;
-    let iface = B::start_as(name, new_name).await?;
-    Ok(MonitorGuard::from_rename(name.to_string(), iface))
+    // Tune through the guard, which already holds the interface `enter`
+    // resolved, so this costs one verified `SET_WIPHY` and no re-enumeration.
+    let pending = match scope {
+        BandScope::ExceptSixGhz => guard.set_channel(channel),
+        BandScope::SixGhzOnly => guard.set_channel_6g(channel),
+    }
+    .with_width(request.width);
+
+    // A guard handed back on the wrong channel is precisely the silent
+    // wrong-channel capture `set_channel_verified` exists to prevent, so a
+    // failed tune tears the session down instead of returning it
+    // half-configured. This mirrors `enter`'s discipline: anything that fails
+    // after the interface was released rolls back before returning.
+    //
+    // The restore is itself fallible. Its error is logged rather than returned,
+    // because the channel failure is the one the caller asked about and the one
+    // that explains why no guard came back; surfacing the teardown error
+    // instead would hide the cause behind a consequence.
+    if let Err(error) = set_channel_with::<B>(pending).await {
+        if let Err(restore_error) = guard.restore().await {
+            warn!(
+                %restore_error,
+                "could not restore the interface after a failed channel set",
+            );
+        }
+        return Err(error);
+    }
+
+    Ok(guard)
 }
 
 async fn stop_monitor_with<B: MonitorBackend>(name: &str) -> Result<String> {
@@ -518,8 +721,14 @@ mod tests {
     // in `fail_stop`, and every call appends to `calls` so tests can assert the
     // exact sequence a dispatcher made.
     struct MockState {
-        interfaces: Vec<WirelessInterface>,
+        interfaces: Vec<InterfaceInfo>,
         fail_stop: Vec<String>,
+        // The width the last `set_channel` was asked for. Kept out of the call
+        // log because most tests assert on the exact call sequence and would
+        // all have to spell out a width they do not care about.
+        width: Option<ChannelWidth>,
+        // What `read_tuning` reports back.
+        tuning: Tuning,
         calls: Vec<String>,
     }
 
@@ -528,6 +737,8 @@ mod tests {
             Self {
                 interfaces: Vec::new(),
                 fail_stop: Vec::new(),
+                width: None,
+                tuning: Tuning::UNTUNED,
                 calls: Vec::new(),
             }
         }
@@ -553,7 +764,7 @@ mod tests {
         MOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn set_interfaces(interfaces: Vec<WirelessInterface>) {
+    fn set_interfaces(interfaces: Vec<InterfaceInfo>) {
         lock().interfaces = interfaces;
     }
 
@@ -565,10 +776,18 @@ mod tests {
         lock().calls.clone()
     }
 
+    fn width_seen() -> Option<ChannelWidth> {
+        lock().width
+    }
+
+    fn set_tuning(tuning: Tuning) {
+        lock().tuning = tuning;
+    }
+
     // A minimal interface carrying 2.4 GHz channel 1 (2412 MHz) so channel
     // resolution has something to resolve against.
-    fn iface(name: &str, mode: InterfaceMode) -> WirelessInterface {
-        WirelessInterface {
+    fn iface(name: &str, mode: InterfaceMode) -> InterfaceInfo {
+        InterfaceInfo {
             name: name.to_string(),
             index: 1,
             phy_index: 0,
@@ -595,19 +814,19 @@ mod tests {
     pub(super) struct MockBackend;
 
     impl MonitorBackend for MockBackend {
-        async fn detect() -> Result<Vec<WirelessInterface>> {
+        async fn detect() -> Result<Vec<InterfaceInfo>> {
             let mut m = lock();
             m.calls.push("detect".to_string());
             Ok(m.interfaces.clone())
         }
 
-        async fn start_auto() -> Result<WirelessInterface> {
+        async fn start_auto() -> Result<InterfaceInfo> {
             let mut m = lock();
             m.calls.push("start_auto".to_string());
             m.interfaces.first().cloned().ok_or(Error::NoInterfaces)
         }
 
-        async fn start_on(name: &str) -> Result<WirelessInterface> {
+        async fn start_on(name: &str) -> Result<InterfaceInfo> {
             let mut m = lock();
             m.calls.push(format!("start_on {name}"));
             m.interfaces
@@ -620,7 +839,7 @@ mod tests {
                 })
         }
 
-        async fn start_as(name: &str, new_name: &str) -> Result<WirelessInterface> {
+        async fn start_as(name: &str, new_name: &str) -> Result<InterfaceInfo> {
             let mut m = lock();
             m.calls.push(format!("start_as {name}->{new_name}"));
             Ok(iface(new_name, InterfaceMode::Monitor))
@@ -632,14 +851,21 @@ mod tests {
         }
 
         async fn set_channel(
-            iface: &WirelessInterface,
+            iface: &InterfaceInfo,
             freq_mhz: u32,
-            _width: ChannelWidth,
+            width: ChannelWidth,
         ) -> Result<()> {
-            lock()
-                .calls
+            let mut m = lock();
+            m.calls
                 .push(format!("set_channel {} {freq_mhz}", iface.name()));
+            m.width = Some(width);
             Ok(())
+        }
+
+        async fn read_tuning(iface: &InterfaceInfo) -> Result<Tuning> {
+            let mut m = lock();
+            m.calls.push(format!("read_tuning {}", iface.name()));
+            Ok(m.tuning)
         }
 
         async fn stop(name: &str) -> Result<()> {
@@ -746,7 +972,7 @@ mod tests {
         let _scope = mock_scope();
         set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
 
-        let guard = start_monitor_with::<MockBackend>().await.unwrap();
+        let guard = start_with::<MockBackend>(start_monitor()).await.unwrap();
         assert_eq!(guard.name(), "wlan0");
         assert_eq!(guard.original_name(), "wlan0");
         guard.persist(); // disarm so the guard's Drop is a no-op
@@ -755,12 +981,312 @@ mod tests {
     #[tokio::test]
     async fn start_as_rejects_invalid_name() {
         let _scope = mock_scope();
-        let err = start_monitor_as_with::<MockBackend>("wlan0", "bad name")
+        let err = start_with::<MockBackend>(start_monitor_as("wlan0", "bad name"))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::InvalidInterfaceName { .. }));
         // Validation happens first, so the backend is never called.
         assert!(calls().is_empty());
+    }
+
+    // --- InterfaceInfo::lookup ---
+
+    #[tokio::test]
+    async fn lookup_finds_an_interface_by_name() {
+        let _scope = mock_scope();
+        set_interfaces(vec![
+            iface("wlan0", InterfaceMode::Managed),
+            iface("wlan1", InterfaceMode::Monitor),
+        ]);
+
+        let found = InterfaceInfo::lookup("wlan1").await.unwrap();
+        assert_eq!(found.name(), "wlan1");
+        assert!(found.is_monitor());
+        // One enumeration, not one per field: the whole point of handing back
+        // the record rather than answering questions about it.
+        assert_eq!(calls(), vec!["detect"]);
+    }
+
+    #[tokio::test]
+    async fn lookup_names_what_does_exist_when_it_misses() {
+        let _scope = mock_scope();
+        set_interfaces(vec![
+            iface("wlan0", InterfaceMode::Managed),
+            iface("wlan1", InterfaceMode::Managed),
+        ]);
+
+        let err = InterfaceInfo::lookup("wlan9").await.unwrap_err();
+        // The available list is the useful half of this error: a wrong name is
+        // usually a typo or a renamed interface, and both are answered by
+        // seeing the real ones.
+        match err {
+            Error::NotFound { name, available } => {
+                assert_eq!(name, "wlan9");
+                assert_eq!(available, "wlan0, wlan1");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_distinguishes_an_empty_system_from_a_miss() {
+        let _scope = mock_scope();
+        // No interfaces at all is a different problem from "not that one", and
+        // an empty available list would read as a bug rather than an answer.
+        let err = InterfaceInfo::lookup("wlan0").await.unwrap_err();
+        assert!(matches!(err, Error::NoInterfaces));
+    }
+
+    // --- guard accessors ---
+
+    #[tokio::test]
+    async fn guard_exposes_its_interface_info() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+
+        let guard = start_with::<MockBackend>(start_monitor()).await.unwrap();
+        // Static facts come off the snapshot the session already holds, so no
+        // further backend traffic.
+        assert_eq!(guard.info().name(), "wlan0");
+        assert_eq!(guard.info().mac(), MacAddr::ZERO);
+        assert_eq!(calls(), vec!["start_auto"]);
+        guard.persist();
+    }
+
+    #[tokio::test]
+    async fn guard_reads_tuning_live() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+        set_tuning(Tuning {
+            freq_mhz: Some(2412),
+            width_mhz: Some(20),
+            center_mhz: Some(2412),
+        });
+
+        let guard = start_with::<MockBackend>(start_monitor()).await.unwrap();
+        assert_eq!(guard.channel().await.unwrap(), Some(1));
+        assert_eq!(guard.frequency().await.unwrap(), Some(2412));
+        assert_eq!(guard.width().await.unwrap(), Some(ChannelWidth::Mhz20));
+
+        // Live means live: each accessor reaches the backend rather than
+        // reporting anything cached on the guard. It is also why `tuning` is
+        // the one to reach for when more than one of these is wanted: this is
+        // three reads of a value that arrives in one message.
+        assert_eq!(
+            calls(),
+            vec![
+                "start_auto",
+                "read_tuning wlan0",
+                "read_tuning wlan0",
+                "read_tuning wlan0",
+            ]
+        );
+        guard.persist();
+    }
+
+    #[tokio::test]
+    async fn guard_reports_a_frequency_off_the_channel_grid() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+        // Between 2.4 GHz channels 1 and 2: a real frequency that maps to no
+        // channel number. This is the case `frequency` exists for, since
+        // `channel` can only answer `None`.
+        set_tuning(Tuning {
+            freq_mhz: Some(2413),
+            width_mhz: Some(20),
+            center_mhz: Some(2413),
+        });
+
+        let guard = start_with::<MockBackend>(start_monitor()).await.unwrap();
+        assert_eq!(guard.channel().await.unwrap(), None);
+        assert_eq!(guard.frequency().await.unwrap(), Some(2413));
+        guard.persist();
+    }
+
+    #[tokio::test]
+    async fn guard_tuning_answers_everything_in_one_read() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+        set_tuning(Tuning {
+            freq_mhz: Some(5180),
+            width_mhz: Some(40),
+            center_mhz: Some(5190),
+        });
+
+        let guard = start_with::<MockBackend>(start_monitor()).await.unwrap();
+        let tuning = guard.tuning().await.unwrap();
+        assert_eq!(tuning.channel(), Some(36));
+        assert_eq!(tuning.width(), Some(ChannelWidth::Mhz40Above));
+        // Both answers from a single readback, which is why `tuning` exists
+        // alongside the two conveniences.
+        assert_eq!(calls(), vec!["start_auto", "read_tuning wlan0"]);
+        guard.persist();
+    }
+
+    #[tokio::test]
+    async fn guard_reports_an_untuned_interface_without_erroring() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+
+        let guard = start_with::<MockBackend>(start_monitor()).await.unwrap();
+        // Not being on a channel is a state, not a failure: a freshly switched
+        // interface reports exactly this until something tunes it.
+        assert_eq!(guard.channel().await.unwrap(), None);
+        assert!(!guard.tuning().await.unwrap().is_tuned());
+        guard.persist();
+    }
+
+    // --- MonitorBuilder chaining ---
+
+    #[tokio::test]
+    async fn builder_does_nothing_until_awaited() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+
+        // Built and configured, never awaited: the hardware must be untouched.
+        // This is the property `#[must_use]` protects, asserted rather than
+        // assumed, since a builder that eagerly started work would make every
+        // `start_*` call a side effect at the point of construction.
+        let _unawaited = start_monitor()
+            .on_channel(1)
+            .with_width(ChannelWidth::Mhz40Above);
+        assert!(calls().is_empty(), "calls were {:?}", calls());
+    }
+
+    #[tokio::test]
+    async fn builder_enters_monitor_then_tunes() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+
+        let guard = start_with::<MockBackend>(start_monitor().on_channel(1))
+            .await
+            .unwrap();
+        assert_eq!(guard.name(), "wlan0");
+
+        // Order matters: the channel is set only after monitor mode is
+        // confirmed. Tuning first would apply to an interface still in managed
+        // mode, where the mode switch that follows can reset it.
+        //
+        // No `detect` between the two: the guard carries the interface `enter`
+        // already resolved, which is the whole point of tuning through it.
+        assert_eq!(calls(), vec!["start_auto", "set_channel wlan0 2412"]);
+        guard.persist();
+    }
+
+    #[tokio::test]
+    async fn builder_without_a_channel_does_not_tune() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+
+        let guard = start_with::<MockBackend>(start_monitor()).await.unwrap();
+        assert_eq!(calls(), vec!["start_auto"]);
+        guard.persist();
+    }
+
+    #[tokio::test]
+    async fn builder_tunes_a_named_interface() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+
+        let guard = start_with::<MockBackend>(start_monitor_on("wlan0").on_channel(1))
+            .await
+            .unwrap();
+        assert_eq!(calls(), vec!["start_on wlan0", "set_channel wlan0 2412"]);
+        guard.persist();
+    }
+
+    #[tokio::test]
+    async fn builder_rolls_back_when_the_channel_cannot_be_resolved() {
+        let _scope = mock_scope();
+        // The mock interface carries 2.4 GHz channel 1 only, so channel 44 is
+        // not resolvable on it.
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+
+        let err = start_with::<MockBackend>(start_monitor().on_channel(44))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ChannelUnavailable { channel: 44, .. }));
+
+        // The session was entered and then torn back down. Returning the guard
+        // anyway would leave the caller holding a monitor interface parked on
+        // whatever channel the driver defaulted to, which is the failure mode
+        // the verified set exists to prevent.
+        assert_eq!(calls(), vec!["start_auto", "stop wlan0"]);
+    }
+
+    #[tokio::test]
+    async fn builder_rollback_undoes_a_rename_too() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+
+        let err = start_with::<MockBackend>(start_monitor_as("wlan0", "mon0").on_channel(44))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ChannelUnavailable { .. }));
+
+        // Rollback goes through the guard, so the rename is undone before the
+        // interface is handed back, and the handback is addressed to the name
+        // the interface actually carries again.
+        assert_eq!(
+            calls(),
+            vec!["start_as wlan0->mon0", "rename mon0->wlan0", "stop wlan0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_carries_the_requested_width() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+
+        let guard = start_with::<MockBackend>(
+            start_monitor()
+                .on_channel(1)
+                .with_width(ChannelWidth::Mhz40Below),
+        )
+        .await
+        .unwrap();
+        assert_eq!(width_seen(), Some(ChannelWidth::Mhz40Below));
+        guard.persist();
+    }
+
+    #[tokio::test]
+    async fn builder_keeps_the_last_band_choice() {
+        let _scope = mock_scope();
+        set_interfaces(vec![iface("wlan0", InterfaceMode::Monitor)]);
+
+        // `on_channel_6g` then `on_channel` leaves a 2.4/5 GHz request, so
+        // channel 1 resolves against the mock's 2.4 GHz band rather than
+        // failing as a 6 GHz channel the device does not have.
+        let guard = start_with::<MockBackend>(start_monitor().on_channel_6g(1).on_channel(1))
+            .await
+            .unwrap();
+        assert_eq!(calls(), vec!["start_auto", "set_channel wlan0 2412"]);
+        guard.persist();
+    }
+
+    #[tokio::test]
+    async fn builder_resolves_six_ghz_in_the_six_ghz_band() {
+        let _scope = mock_scope();
+        // 6 GHz channel 1 is 5955 MHz; 2.4 GHz channel 1 is 2412 MHz. Both are
+        // present, so the frequency that comes back is what proves the scope
+        // was carried through rather than defaulted.
+        let mut sixe = iface("wlan0", InterfaceMode::Monitor);
+        sixe.bands.push(Band {
+            kind: BandKind::SixGhz,
+            frequencies: vec![Frequency {
+                mhz: 5955,
+                channel: Some(1),
+                disabled: false,
+                radar: false,
+            }],
+        });
+        set_interfaces(vec![sixe]);
+
+        let guard = start_with::<MockBackend>(start_monitor().on_channel_6g(1))
+            .await
+            .unwrap();
+        assert_eq!(calls(), vec!["start_auto", "set_channel wlan0 5955"]);
+        guard.persist();
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use crate::{MacAddr, Result};
 
 /* Constants */
 
-// Capture-selection score weights (see `WirelessInterface::monitor_score`).
+// Capture-selection score weights (see `InterfaceInfo::monitor_score`).
 // The associated penalty dominates: an interface carrying the host's live
 // connection is avoided unless nothing else can do the job.
 const SCORE_KNOWN_MONITOR_DRIVER: i32 = 40;
@@ -139,6 +139,24 @@ pub struct Frequency {
     pub(crate) radar: bool,
 }
 
+/// What an interface reports about the channel it is currently sitting on.
+///
+/// Returned by [`MonitorGuard::tuning`](crate::MonitorGuard::tuning). Unlike the
+/// rest of the data model this is *live*: it is read from the kernel at the
+/// moment you ask, not carried from an earlier enumeration, because it is the
+/// one part of an interface's state that a capture session changes as it runs.
+///
+/// Every field is optional because an interface that is not tuned reports none
+/// of them, and a driver may report only some. The width is normalised to plain
+/// MHz: nl80211 distinguishes `20_NOHT` from `20`, but nothing here needs to
+/// tell those apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Tuning {
+    pub(crate) freq_mhz: Option<u32>,
+    pub(crate) width_mhz: Option<u32>,
+    pub(crate) center_mhz: Option<u32>,
+}
+
 /// Which bands a channel number is resolved against.
 ///
 /// 6 GHz reuses channel numbers that 2.4 GHz and 5 GHz already use: 1, 5, 9 and
@@ -166,10 +184,10 @@ pub struct Band {
 
 /// A wireless interface joined with the capabilities of its physical device.
 ///
-/// Obtain instances via [`WirelessInterface::detect`]. Fields are populated by
+/// Obtain instances via [`InterfaceInfo::detect`]. Fields are populated by
 /// the active platform backend.
 #[derive(Debug, Clone)]
-pub struct WirelessInterface {
+pub struct InterfaceInfo {
     pub(crate) name: String,
     pub(crate) index: u32,
     pub(crate) phy_index: u32,
@@ -253,17 +271,95 @@ impl BandScope {
     }
 }
 
+impl Tuning {
+    /// What an interface that is not tuned to any channel reports.
+    pub(crate) const UNTUNED: Self = Self {
+        freq_mhz: None,
+        width_mhz: None,
+        center_mhz: None,
+    };
+
+    /// The primary center frequency in MHz, or `None` if the interface is not
+    /// tuned.
+    #[must_use]
+    pub fn frequency_mhz(&self) -> Option<u32> {
+        self.freq_mhz
+    }
+
+    /// The IEEE channel number, if the frequency sits on a known grid.
+    ///
+    /// The counterpart to the channel number passed to
+    /// [`set_channel`](crate::set_channel): a round trip through this should
+    /// give back what was asked for.
+    #[must_use]
+    pub fn channel(&self) -> Option<u32> {
+        self.freq_mhz.and_then(channel_from_mhz)
+    }
+
+    /// The channel width in plain MHz, whatever the device reported.
+    ///
+    /// Unlike [`width`](Self::width) this is not limited to the widths this
+    /// library can request, so a device parked at 80 or 160 MHz by something
+    /// else reports it here rather than as `None`.
+    #[must_use]
+    pub fn width_mhz(&self) -> Option<u32> {
+        self.width_mhz
+    }
+
+    /// The segment center frequency in MHz, which for a 40 MHz channel is what
+    /// distinguishes HT40+ from HT40-.
+    #[must_use]
+    pub fn center_mhz(&self) -> Option<u32> {
+        self.center_mhz
+    }
+
+    /// Whether the interface is tuned to any channel at all.
+    #[must_use]
+    pub fn is_tuned(&self) -> bool {
+        self.freq_mhz.is_some()
+    }
+
+    /// The width as one of the values this library can request.
+    ///
+    /// `None` when the device is untuned, or reports a width this library never
+    /// requests (80 or 160 MHz), or reports 40 MHz with a segment center that is
+    /// neither 10 MHz above nor 10 MHz below the primary. Use
+    /// [`width_mhz`](Self::width_mhz) to see what it actually said in those
+    /// cases.
+    #[must_use]
+    pub fn width(&self) -> Option<ChannelWidth> {
+        self.width_at(self.freq_mhz?)
+    }
+
+    // The width interpreted against a primary frequency supplied by the caller
+    // rather than taken from the readback. Verification needs this form: it
+    // compares against the frequency that was *requested*, having already
+    // confirmed the readback matches it, so the two cannot disagree there.
+    pub(crate) fn width_at(&self, primary_mhz: u32) -> Option<ChannelWidth> {
+        match self.width_mhz? {
+            20 => Some(ChannelWidth::Mhz20),
+            40 => match self.center_mhz? {
+                center if center == primary_mhz + 10 => Some(ChannelWidth::Mhz40Above),
+                // Written as an addition so a center below 10 MHz cannot underflow.
+                center if center + 10 == primary_mhz => Some(ChannelWidth::Mhz40Below),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
 impl Frequency {
     /// The center frequency in MHz.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// for iface in WirelessInterface::detect().await? {
+    /// for iface in InterfaceInfo::detect().await? {
     ///     for freq in iface.frequencies() {
     ///         println!("{} MHz", freq.mhz());
     ///     }
@@ -284,11 +380,11 @@ impl Frequency {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// let tunable: Vec<u32> = iface.frequencies().filter_map(|f| f.channel()).collect();
     /// println!("{} channels addressable by number", tunable.len());
     /// # Ok(())
@@ -308,11 +404,11 @@ impl Frequency {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// let usable = iface.frequencies().filter(|f| !f.is_disabled()).count();
     /// println!("{usable} usable frequencies in this regulatory domain");
     /// # Ok(())
@@ -331,11 +427,11 @@ impl Frequency {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// for freq in iface.frequencies().filter(|f| f.is_radar()) {
     ///     println!("{} MHz is a DFS channel", freq.mhz());
     /// }
@@ -354,11 +450,11 @@ impl Band {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::{BandKind, WirelessInterface};
+    /// use rfmon::{BandKind, InterfaceInfo};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// let six_e = iface.bands().iter().any(|b| b.kind() == BandKind::SixGhz);
     /// println!("6 GHz capable: {six_e}");
     /// # Ok(())
@@ -374,11 +470,11 @@ impl Band {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// for band in iface.bands() {
     ///     println!("{}: {} frequencies", band.kind(), band.frequencies().len());
     /// }
@@ -391,17 +487,17 @@ impl Band {
     }
 }
 
-impl WirelessInterface {
+impl InterfaceInfo {
     /// Kernel interface name, e.g. `wlan0`.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// for iface in WirelessInterface::detect().await? {
+    /// for iface in InterfaceInfo::detect().await? {
     ///     println!("{}", iface.name());
     /// }
     /// # Ok(())
@@ -420,11 +516,11 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// println!("{} is if_index {}", iface.name(), iface.index());
     /// # Ok(())
     /// # }
@@ -442,11 +538,11 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// for iface in WirelessInterface::detect().await? {
+    /// for iface in InterfaceInfo::detect().await? {
     ///     println!("{} sits on phy{}", iface.name(), iface.phy_index());
     /// }
     /// # Ok(())
@@ -462,11 +558,11 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// println!("{} has MAC {}", iface.name(), iface.mac());
     /// # Ok(())
     /// # }
@@ -481,11 +577,11 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::{InterfaceMode, WirelessInterface};
+    /// use rfmon::{InterfaceMode, InterfaceInfo};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// if iface.mode() == InterfaceMode::Managed {
     ///     println!("{} is a normal client right now", iface.name());
     /// }
@@ -502,11 +598,11 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// let modes: Vec<String> = iface.supported_modes().iter().map(|m| m.to_string()).collect();
     /// println!("{} supports: {}", iface.name(), modes.join(", "));
     /// # Ok(())
@@ -522,11 +618,11 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// for band in iface.bands() {
     ///     println!("{}", band.kind());
     /// }
@@ -546,11 +642,11 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// println!("{} frequencies in total", iface.frequencies().count());
     /// # Ok(())
     /// # }
@@ -570,11 +666,11 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// if !iface.supports_monitor() && iface.is_monitor_plausible() {
     ///     println!("{} does not advertise monitor mode but probably has it", iface.name());
     /// }
@@ -591,12 +687,12 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
     /// // What `stop_all_monitors` sweeps.
-    /// for iface in WirelessInterface::detect().await?.iter().filter(|i| i.is_monitor()) {
+    /// for iface in InterfaceInfo::detect().await?.iter().filter(|i| i.is_monitor()) {
     ///     println!("{} is still in monitor mode", iface.name());
     /// }
     /// # Ok(())
@@ -615,11 +711,11 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// println!("{} uses {}", iface.name(), iface.driver().unwrap_or("an unknown driver"));
     /// # Ok(())
     /// # }
@@ -634,12 +730,12 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::{BusKind, WirelessInterface};
+    /// use rfmon::{BusKind, InterfaceInfo};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
     /// // External adapters are the ones deliberately attached for capture.
-    /// for iface in WirelessInterface::detect().await? {
+    /// for iface in InterfaceInfo::detect().await? {
     ///     if iface.bus() == BusKind::Usb {
     ///         println!("{} is external", iface.name());
     ///     }
@@ -657,11 +753,11 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// # let iface = WirelessInterface::detect().await?.remove(0);
+    /// # let iface = InterfaceInfo::detect().await?.remove(0);
     /// match iface.ssid() {
     ///     Some(ssid) => println!("{} is on {ssid}", iface.name()),
     ///     None => println!("{} is idle", iface.name()),
@@ -682,12 +778,12 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
     /// // Pick a radio that is not carrying the host's uplink.
-    /// let interfaces = WirelessInterface::detect().await?;
+    /// let interfaces = InterfaceInfo::detect().await?;
     /// let idle = interfaces.iter().find(|i| !i.is_associated());
     /// println!("{:?}", idle.map(|i| i.name()));
     /// # Ok(())
@@ -711,12 +807,12 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
     /// // The filter `start_monitor` applies before scoring the survivors.
-    /// let interfaces = WirelessInterface::detect().await?;
+    /// let interfaces = InterfaceInfo::detect().await?;
     /// let candidates = interfaces.iter().filter(|i| i.is_monitor_plausible()).count();
     /// println!("{candidates} plausible capture radio(s)");
     /// # Ok(())
@@ -738,11 +834,11 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// let mut interfaces = WirelessInterface::detect().await?;
+    /// let mut interfaces = InterfaceInfo::detect().await?;
     /// // The same ranking `start_monitor` applies internally.
     /// interfaces.sort_by_key(|iface| -iface.monitor_score());
     /// # Ok(())
@@ -781,18 +877,71 @@ impl WirelessInterface {
     /// # Examples
     ///
     /// ```no_run
-    /// use rfmon::WirelessInterface;
+    /// use rfmon::InterfaceInfo;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> rfmon::Result<()> {
-    /// for iface in WirelessInterface::detect().await? {
+    /// for iface in InterfaceInfo::detect().await? {
     ///     println!("{} (score {})", iface.name(), iface.monitor_score());
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn detect() -> Result<Vec<WirelessInterface>> {
+    pub async fn detect() -> Result<Vec<InterfaceInfo>> {
         crate::monitor::detect().await
+    }
+
+    /// Look one interface up by name.
+    ///
+    /// There is no cheaper path to a single interface than to the whole set:
+    /// this runs the same full enumeration [`detect`](Self::detect) does and
+    /// then discards everything that is not `name`. Hold the result rather than
+    /// calling this once per field, and prefer `detect()` with your own filter
+    /// when you are looking at several interfaces.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoInterfaces`](crate::Error::NoInterfaces) if the system has no
+    /// wireless interfaces at all, or
+    /// [`Error::NotFound`](crate::Error::NotFound) if none of them is `name`.
+    /// `NotFound` carries the names that *do* exist, which is usually the answer
+    /// when a name is wrong.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rfmon::InterfaceInfo;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> rfmon::Result<()> {
+    /// let iface = InterfaceInfo::lookup("wlan0").await?;
+    /// println!("{} on {} ({})", iface.name(), iface.bus(), iface.mac());
+    /// // Every getter from here on is a free field read.
+    /// if iface.is_monitor() {
+    ///     println!("already capturing; rfmon will not take it");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn lookup(name: &str) -> Result<InterfaceInfo> {
+        let interfaces = Self::detect().await?;
+        if interfaces.is_empty() {
+            return Err(crate::Error::NoInterfaces);
+        }
+
+        let available = interfaces
+            .iter()
+            .map(InterfaceInfo::name)
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        interfaces
+            .into_iter()
+            .find(|iface| iface.name() == name)
+            .ok_or(crate::Error::NotFound {
+                name: name.to_string(),
+                available,
+            })
     }
 }
 
@@ -850,7 +999,7 @@ pub(crate) fn is_known_monitor_driver(driver: &str) -> bool {
 
 // Order two candidates: highest score wins, ties break toward the lower
 // interface index so selection is deterministic across runs.
-fn rank(a: &WirelessInterface, b: &WirelessInterface) -> std::cmp::Ordering {
+fn rank(a: &InterfaceInfo, b: &InterfaceInfo) -> std::cmp::Ordering {
     a.monitor_score()
         .cmp(&b.monitor_score())
         .then_with(|| b.index.cmp(&a.index))
@@ -863,17 +1012,15 @@ fn rank(a: &WirelessInterface, b: &WirelessInterface) -> std::cmp::Ordering {
 // cannot be known until it is tried: the driver-name heuristic is a prior, and a
 // radio that advertises monitor mode can still refuse the switch. The caller
 // works down the list until one is confirmed.
-pub(crate) fn rank_candidates(
-    interfaces: Vec<WirelessInterface>,
-) -> Result<Vec<WirelessInterface>> {
+pub(crate) fn rank_candidates(interfaces: Vec<InterfaceInfo>) -> Result<Vec<InterfaceInfo>> {
     if interfaces.is_empty() {
         return Err(crate::Error::NoInterfaces);
     }
     let checked = interfaces.len();
 
-    let plausible: Vec<WirelessInterface> = interfaces
+    let plausible: Vec<InterfaceInfo> = interfaces
         .into_iter()
-        .filter(WirelessInterface::is_monitor_plausible)
+        .filter(InterfaceInfo::is_monitor_plausible)
         .collect();
     if plausible.is_empty() {
         return Err(crate::Error::NoMonitorCapable { checked });
@@ -883,7 +1030,7 @@ pub(crate) fn rank_candidates(
     // it there, and commandeering it is destructive in both directions (see
     // `Error::AlreadyMonitor`). Partitioned rather than filtered so the error
     // can name the radio that *would* have been chosen.
-    let (mut idle, busy): (Vec<WirelessInterface>, Vec<WirelessInterface>) =
+    let (mut idle, busy): (Vec<InterfaceInfo>, Vec<InterfaceInfo>) =
         plausible.into_iter().partition(|iface| !iface.is_monitor());
 
     if idle.is_empty() {
@@ -905,7 +1052,7 @@ pub(crate) fn rank_candidates(
 // list, but the selection tests are about who wins, and threading `[0]` through
 // every one of them would obscure that.
 #[cfg(test)]
-pub(crate) fn pick_best(interfaces: Vec<WirelessInterface>) -> Result<WirelessInterface> {
+pub(crate) fn pick_best(interfaces: Vec<InterfaceInfo>) -> Result<InterfaceInfo> {
     rank_candidates(interfaces).map(|mut ranked| ranked.remove(0))
 }
 
@@ -917,7 +1064,7 @@ pub(crate) fn pick_best(interfaces: Vec<WirelessInterface>) -> Result<WirelessIn
 // than `ChannelUnavailable`, so a 6 GHz number typed into `set_channel` says so
 // instead of claiming the device cannot reach it.
 pub(crate) fn resolve_frequency(
-    iface: &WirelessInterface,
+    iface: &InterfaceInfo,
     channel: u32,
     scope: BandScope,
 ) -> Result<u32> {
@@ -1083,8 +1230,8 @@ mod tests {
         driver: Option<&str>,
         bus: BusKind,
         ssid: Option<&str>,
-    ) -> WirelessInterface {
-        WirelessInterface {
+    ) -> InterfaceInfo {
+        InterfaceInfo {
             name: name.to_string(),
             index,
             phy_index: 0,
@@ -1281,8 +1428,8 @@ mod tests {
     }
 
     // Build an interface carrying explicit bands for channel-resolution tests.
-    fn iface_with_bands(bands: Vec<Band>) -> WirelessInterface {
-        WirelessInterface {
+    fn iface_with_bands(bands: Vec<Band>) -> InterfaceInfo {
+        InterfaceInfo {
             name: "wlan0".to_string(),
             index: 2,
             phy_index: 0,
@@ -1398,7 +1545,7 @@ mod tests {
 
     // A 6E adapter: every one of these channel numbers exists in two bands at
     // once. The scope carried by the entry point is what makes each unambiguous.
-    fn sixe_iface() -> WirelessInterface {
+    fn sixe_iface() -> InterfaceInfo {
         iface_with_bands(vec![
             Band {
                 kind: BandKind::TwoGhz,
@@ -1487,6 +1634,68 @@ mod tests {
             resolve_frequency(&iface, 36, BandScope::ExceptSixGhz).unwrap_err(),
             crate::Error::AmbiguousChannel { channel: 36, .. }
         ));
+    }
+
+    // A readback for a device sitting where it was asked to.
+    fn tuned(freq_mhz: u32, width_mhz: u32, center_mhz: u32) -> Tuning {
+        Tuning {
+            freq_mhz: Some(freq_mhz),
+            width_mhz: Some(width_mhz),
+            center_mhz: Some(center_mhz),
+        }
+    }
+
+    #[test]
+    fn tuning_reports_channel_and_frequency() {
+        let tuning = tuned(5180, 20, 5180);
+        assert_eq!(tuning.frequency_mhz(), Some(5180));
+        assert_eq!(tuning.channel(), Some(36));
+        assert!(tuning.is_tuned());
+
+        assert_eq!(Tuning::UNTUNED.channel(), None);
+        assert_eq!(Tuning::UNTUNED.frequency_mhz(), None);
+        assert!(!Tuning::UNTUNED.is_tuned());
+    }
+
+    #[test]
+    fn tuning_classifies_the_widths_this_library_requests() {
+        assert_eq!(tuned(5180, 20, 5180).width(), Some(ChannelWidth::Mhz20));
+        // 40 MHz is only fully described by its segment centre: which side the
+        // secondary sits on is the difference between HT40+ and HT40-.
+        assert_eq!(
+            tuned(5180, 40, 5190).width(),
+            Some(ChannelWidth::Mhz40Above)
+        );
+        assert_eq!(
+            tuned(5180, 40, 5170).width(),
+            Some(ChannelWidth::Mhz40Below)
+        );
+    }
+
+    #[test]
+    fn tuning_reports_no_width_for_anything_it_cannot_name() {
+        // 40 MHz centred neither 10 above nor 10 below the primary.
+        assert_eq!(tuned(5180, 40, 5210).width(), None);
+        // A width this library never requests; something else set it.
+        assert_eq!(tuned(5180, 80, 5210).width(), None);
+        assert_eq!(Tuning::UNTUNED.width(), None);
+
+        // But the raw figure survives in every case, so a caller can still see
+        // what the device actually said.
+        assert_eq!(tuned(5180, 80, 5210).width_mhz(), Some(80));
+        assert_eq!(tuned(5180, 40, 5210).center_mhz(), Some(5210));
+    }
+
+    #[test]
+    fn tuning_width_does_not_underflow_near_zero() {
+        // `width_at` compares by addition precisely so a centre below 10 MHz
+        // cannot wrap a u32 subtraction into a false match.
+        let low = Tuning {
+            freq_mhz: Some(5),
+            width_mhz: Some(40),
+            center_mhz: Some(0),
+        };
+        assert_eq!(low.width(), None);
     }
 
     #[test]

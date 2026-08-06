@@ -23,7 +23,7 @@ use wl_nl80211::{
 
 use crate::errors::LinuxError;
 use crate::interface::{
-    Band, BandKind, BusKind, ChannelWidth, Frequency, InterfaceMode, WirelessInterface,
+    Band, BandKind, BusKind, ChannelWidth, Frequency, InterfaceInfo, InterfaceMode, Tuning,
 };
 use crate::linux::{NETLINK_TIMEOUT, with_timeout};
 use crate::{MacAddr, Result, channel_from_mhz};
@@ -55,30 +55,6 @@ struct PhyAccum {
     // Keyed by raw nl80211 band value so split-dump fragments of the same band
     // merge their frequency lists rather than producing duplicate bands.
     bands: BTreeMap<u16, (BandKind, Vec<Frequency>)>,
-}
-
-/// The tuning an interface reports: primary frequency, channel width, and the
-/// segment centre of a wide channel.
-///
-/// Every field is optional because an interface that is not tuned reports none
-/// of them, and because a driver may report a subset. The width is normalised to
-/// plain MHz. nl80211 distinguishes `20_NOHT` from `20`, but for verification
-/// they are the same answer, and demanding the exact variant back would fail
-/// sets the driver actually honoured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct ChannelState {
-    pub(crate) freq_mhz: Option<u32>,
-    pub(crate) width_mhz: Option<u32>,
-    pub(crate) center_mhz: Option<u32>,
-}
-
-impl ChannelState {
-    /// What an interface that is not tuned to any channel reports.
-    pub(crate) const UNTUNED: Self = Self {
-        freq_mhz: None,
-        width_mhz: None,
-        center_mhz: None,
-    };
 }
 
 // Resolved capabilities for a single wiphy.
@@ -114,7 +90,7 @@ impl PhyAccum {
 /// Detect every wireless interface, joined with its physical device's
 /// capabilities and enriched from sysfs.
 #[instrument(level = "debug", err)]
-pub(crate) async fn detect() -> Result<Vec<WirelessInterface>> {
+pub(crate) async fn detect() -> Result<Vec<InterfaceInfo>> {
     let handle = open_handle()?;
 
     trace!("dumping nl80211 interfaces");
@@ -149,7 +125,7 @@ pub(crate) async fn detect() -> Result<Vec<WirelessInterface>> {
 /// the link back up. Most drivers, including the Realtek USB adapters, refuse
 /// a type change while the link is up. Requires `CAP_NET_ADMIN`.
 #[instrument(level = "debug", skip(iface), fields(iface = %iface.name(), index = iface.index()), err)]
-pub(crate) async fn set_mode(iface: &WirelessInterface, mode: InterfaceMode) -> Result<()> {
+pub(crate) async fn set_mode(iface: &InterfaceInfo, mode: InterfaceMode) -> Result<()> {
     let name = iface.name();
     let index = iface.index();
 
@@ -338,14 +314,14 @@ pub(crate) async fn read_mode(index: u32) -> Result<InterfaceMode> {
 ///
 /// Used to empirically confirm a channel change took effect, the same
 /// "adapters lie" defense [`read_mode`] provides for mode switches. Every field
-/// of the returned [`ChannelState`] is `None` when the interface exists but is
+/// of the returned [`Tuning`] is `None` when the interface exists but is
 /// not tuned; `NotFound` means no interface has the index. Bounded by
 /// [`NETLINK_TIMEOUT`], for the same reason [`read_mode`] is.
 ///
 /// All three attributes are read, not just the primary frequency: a driver that
 /// accepts a 40 MHz request and falls back to 20 lands on the right frequency,
 /// so frequency alone cannot tell a honoured set from a silently narrowed one.
-pub(crate) async fn read_channel(index: u32) -> Result<ChannelState> {
+pub(crate) async fn read_channel(index: u32) -> Result<Tuning> {
     with_timeout("read interface channel", NETLINK_TIMEOUT, async move {
         let handle = open_handle()?;
         // A non-empty attribute set makes this a single get (no dump) for one iface.
@@ -358,7 +334,7 @@ pub(crate) async fn read_channel(index: u32) -> Result<ChannelState> {
         let mut found = false;
         // Start from untuned and fill in whatever the kernel actually reports:
         // a driver may return any subset of the three attributes.
-        let mut state = ChannelState::UNTUNED;
+        let mut state = Tuning::UNTUNED;
         while let Some(msg) = stream.try_next().await.map_err(|source| LinuxError::Dump {
             command: "get_interface",
             source,
@@ -632,7 +608,7 @@ fn extract_frequencies(band: &Nl80211Band) -> Vec<Frequency> {
 // Join raw interfaces with their wiphy capabilities, and enrich each with the
 // driver/bus read from sysfs. Multiple interfaces may share a wiphy, so
 // capabilities are cloned rather than moved.
-fn assemble(raw: Vec<RawInterface>, caps: &BTreeMap<u32, PhyCaps>) -> Vec<WirelessInterface> {
+fn assemble(raw: Vec<RawInterface>, caps: &BTreeMap<u32, PhyCaps>) -> Vec<InterfaceInfo> {
     raw.into_iter()
         .map(|iface| {
             let (supported_modes, bands) = match caps.get(&iface.phy_index) {
@@ -640,7 +616,7 @@ fn assemble(raw: Vec<RawInterface>, caps: &BTreeMap<u32, PhyCaps>) -> Vec<Wirele
                 None => (Vec::new(), Vec::new()),
             };
             let (driver, bus) = read_phy_sysfs(iface.phy_index);
-            WirelessInterface {
+            InterfaceInfo {
                 name: iface.name,
                 index: iface.index,
                 phy_index: iface.phy_index,

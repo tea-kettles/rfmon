@@ -21,7 +21,7 @@
 use tracing::warn;
 
 use crate::Result;
-use crate::interface::{BandScope, WirelessInterface};
+use crate::interface::{BandScope, ChannelWidth, InterfaceInfo, Tuning};
 use crate::monitor::SetChannel;
 
 /* Types */
@@ -44,7 +44,7 @@ pub struct MonitorGuard {
     // The interface as resolved when it entered monitor mode. Its device caps
     // (index, bands) do not change for the session, since a rename alters only the
     // name, so tuning reuses it instead of re-enumerating. See `set_channel`.
-    iface: WirelessInterface,
+    iface: InterfaceInfo,
     armed: bool,
 }
 
@@ -52,7 +52,7 @@ pub struct MonitorGuard {
 
 impl MonitorGuard {
     /// A same-name session: the interface keeps its own name.
-    pub(crate) fn new(iface: WirelessInterface) -> Self {
+    pub(crate) fn new(iface: InterfaceInfo) -> Self {
         let name = iface.name().to_string();
         Self {
             original: name.clone(),
@@ -64,7 +64,7 @@ impl MonitorGuard {
 
     /// A renamed session: `iface` is already under its new name, and teardown
     /// restores `original`.
-    pub(crate) fn from_rename(original: String, iface: WirelessInterface) -> Self {
+    pub(crate) fn from_rename(original: String, iface: InterfaceInfo) -> Self {
         let current = iface.name().to_string();
         Self {
             original,
@@ -112,6 +112,142 @@ impl MonitorGuard {
     #[must_use]
     pub fn original_name(&self) -> &str {
         &self.original
+    }
+
+    /// The interface's static facts: MAC, bands, driver, bus, supported modes.
+    ///
+    /// The snapshot taken when this session entered monitor mode. Everything on
+    /// it is a free field read, and everything on it is a property of the device
+    /// rather than of the session, so none of it goes stale while the guard
+    /// lives. For what *does* change during a session, see
+    /// [`tuning`](Self::tuning).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> rfmon::Result<()> {
+    /// let mon = rfmon::start_monitor().await?;
+    /// println!("capturing on {} ({})", mon.name(), mon.info().mac());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn info(&self) -> &InterfaceInfo {
+        &self.iface
+    }
+
+    /// Read back the channel this interface is currently sitting on.
+    ///
+    /// Live: this asks the OS every time rather than reporting anything cached,
+    /// because the tuning is the one part of an interface's state a session
+    /// changes as it runs, and because something outside this process can move
+    /// it. One call answers frequency, channel number, and width together;
+    /// [`channel`](Self::channel), [`frequency`](Self::frequency) and
+    /// [`width`](Self::width) are conveniences over it that each cost their own
+    /// read.
+    ///
+    /// **Prefer this when you want more than one of them.** The three values are
+    /// correlated: which side a 40 MHz secondary sits on is defined by the
+    /// segment centre *relative to the primary frequency*, so `width` has to
+    /// read the frequency to answer at all. Asking separately means two reads,
+    /// between which the interface can move, and the pair can then describe a
+    /// state that never existed. One call cannot tear.
+    ///
+    /// # Errors
+    ///
+    /// A platform error if the readback fails. An interface that is simply not
+    /// tuned is not an error: it reports a [`Tuning`] whose fields are all
+    /// `None` (see [`Tuning::is_tuned`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> rfmon::Result<()> {
+    /// let mon = rfmon::start_monitor().on_channel(36).await?;
+    /// let tuning = mon.tuning().await?;
+    /// assert_eq!(tuning.channel(), Some(36));
+    /// println!("{:?} MHz at {:?}", tuning.frequency_mhz(), tuning.width());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn tuning(&self) -> Result<Tuning> {
+        crate::monitor::read_tuning(&self.iface).await
+    }
+
+    /// The channel number this interface is currently on, read from the OS.
+    ///
+    /// `None` if the interface is not tuned, or sits on a frequency that is not
+    /// on a recognised channel grid. Calls [`tuning`](Self::tuning); use that
+    /// directly if you also want the width, to avoid a second readback.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> rfmon::Result<()> {
+    /// let mon = rfmon::start_monitor().on_channel(11).await?;
+    /// assert_eq!(mon.channel().await?, Some(11));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn channel(&self) -> Result<Option<u32>> {
+        Ok(self.tuning().await?.channel())
+    }
+
+    /// The primary centre frequency in MHz this interface is currently on, read
+    /// from the OS.
+    ///
+    /// The raw form of [`channel`](Self::channel), for when the channel number
+    /// is not what you want: a device parked off the recognised channel grid
+    /// reports `None` from `channel` but a real frequency here, and log or
+    /// capture metadata often wants MHz regardless.
+    ///
+    /// Note this is the one readback with no counterpart on the way in. The
+    /// library tunes by channel number ([`set_channel`](Self::set_channel)), so
+    /// there is no `set_frequency` for it to mirror; the same is true of
+    /// [`Tuning::width_mhz`] and [`Tuning::center_mhz`].
+    ///
+    /// `None` if the interface is not tuned. Calls [`tuning`](Self::tuning); use
+    /// that directly if you also want the channel or width, to avoid a second
+    /// readback.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> rfmon::Result<()> {
+    /// let mon = rfmon::start_monitor().on_channel(36).await?;
+    /// assert_eq!(mon.frequency().await?, Some(5180));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn frequency(&self) -> Result<Option<u32>> {
+        Ok(self.tuning().await?.frequency_mhz())
+    }
+
+    /// The channel width this interface is currently using, read from the OS.
+    ///
+    /// `None` if the interface is not tuned or reports a width this library
+    /// never requests (80 or 160 MHz, which something else would have had to
+    /// set). Calls [`tuning`](Self::tuning); use that directly if you also want
+    /// the channel, or if you need to see a width outside this set.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rfmon::ChannelWidth;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> rfmon::Result<()> {
+    /// let mon = rfmon::start_monitor().on_channel(6).await?;
+    /// assert_eq!(mon.width().await?, Some(ChannelWidth::Mhz20));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn width(&self) -> Result<Option<ChannelWidth>> {
+        Ok(self.tuning().await?.width())
     }
 
     /// Tune the interface to a 2.4 or 5 GHz channel, reusing the interface this
@@ -207,7 +343,7 @@ impl MonitorGuard {
     }
 }
 
-// Written out rather than derived: `WirelessInterface` is `Debug`, but deriving
+// Written out rather than derived: `InterfaceInfo` is `Debug`, but deriving
 // would print the device's full band and frequency list, dozens of entries,
 // every time a guard is formatted. What identifies a session is the pair of
 // names and whether teardown is still armed.
